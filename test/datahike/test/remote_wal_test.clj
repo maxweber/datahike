@@ -129,6 +129,35 @@
         (delete-store-quietly! (:store cfg-b))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-delete-removes-head-without-dropping-remote-store
+  (let [remote-id (uuid)
+        local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        remote-store (atom nil)]
+    (try
+      ;; A Tigris/S3 bucket may hold unrelated objects; deleting the Datahike
+      ;; remote-WAL database should remove only the WAL head object.
+      (reset! remote-store (ks/create-store remote-store-config {:sync? true}))
+      (k/assoc @remote-store :sentinel :keep-me {:sync? true})
+      (ks/release-store remote-store-config @remote-store {:sync? true})
+      (reset! remote-store nil)
+
+      (d/create-database cfg)
+      (is (true? (d/database-exists? cfg)))
+      (d/delete-database cfg)
+      (is (false? (d/database-exists? cfg)))
+      (is (true? (ks/store-exists? remote-store-config {:sync? true}))
+          "remote-WAL delete should not delete the containing remote store")
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (is (= :keep-me (k/get @remote-store :sentinel nil {:sync? true})))
+      (is (nil? (k/get @remote-store :db nil {:sync? true})))
+      (finally
+        (when @remote-store
+          (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-existing-connection-checks-remote-store
   (let [shared-local-id (uuid)
         remote-id-a (uuid)

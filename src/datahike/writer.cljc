@@ -7,6 +7,7 @@
             [datahike.store :as ds]
             [datahike.config :as dc]
             [datahike.tools :as dt :refer [throwable-promise get-time-ms]]
+            [konserve.core :as k]
             [konserve.store :as ks]
             [clojure.core.async :refer [chan close! promise-chan put! go go-loop <! >! poll! buffer timeout]]
             #?(:cljs [cljs.core.async.impl.channels :refer [ManyToManyChannel]]))
@@ -421,14 +422,35 @@
         #?(:clj (deliver p res) :cljs (if (nil? res) (close! p) (put! p res)))))
     p))
 
+(defn- delete-remote-wal-head! [config opts]
+  (go-try-
+   (let [remote-store-config (get-in config [:writer :remote-store])
+         wal-key (get-in config [:writer :wal-branch])
+         remote-exists? (<?- (ks/store-exists? remote-store-config opts))]
+     (when remote-exists?
+       (let [raw-store (<?- (ks/connect-store remote-store-config opts))
+             store (ds/add-cache-and-handlers raw-store (assoc config :store remote-store-config))
+             result (try
+                      (<?- (ds/ready-store (assoc remote-store-config :opts opts) store))
+                      (<?- (k/dissoc store wal-key opts))
+                      (catch #?(:clj Throwable :cljs js/Error) e
+                        e))]
+         (try
+           (<?- (ks/release-store remote-store-config store opts))
+           (catch #?(:clj Throwable :cljs js/Error) release-error
+             (log/warn :datahike/remote-wal-release-failed {:error release-error})))
+         (when (instance? #?(:clj Throwable :cljs js/Error) result)
+           (throw result))
+         result)))))
+
 (defmethod delete-database :remote-wal [& args]
   (let [p (throwable-promise)]
     (go
       (try
         (let [config (dc/load-config (first args) (next args))
-              remote-store-config (get-in config [:writer :remote-store])
-              local-res (<! (apply w/delete-database args))
-              remote-res (ks/delete-store remote-store-config {:sync? true})]
+              opts {:sync? false}
+              local-res (<?- (apply w/delete-database args))
+              remote-res (<?- (delete-remote-wal-head! config opts))]
           #?(:clj (deliver p (or remote-res local-res))
              :cljs (if (nil? (or remote-res local-res))
                      (close! p)

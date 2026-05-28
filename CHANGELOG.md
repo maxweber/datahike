@@ -19,6 +19,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Remote WAL delete safety** — `delete-database` for `:remote-wal` now removes the WAL head object without deleting the containing remote store/bucket. (0.8.TODO, [#TODO])
 - **Remote WAL connection cache isolation** — existing remote-WAL connections now compare the remote store identity before reuse, preventing a shared local cache from silently returning a connection to a different WAL head. (0.8.TODO, [#TODO])
 - **Remote WAL CAS retry isolation** — CAS conflicts no longer clear store-level pending index writes that may belong to concurrent background materialization. (0.8.TODO, [#TODO])
 - **Remote WAL file-cache restart** — remote materialized checkpoints are localized onto the configured cache store before subsequent local materialization, so fresh file caches can transact, flush, and reconnect without retaining index roots tied to the remote store. (0.8.TODO, [#TODO])
