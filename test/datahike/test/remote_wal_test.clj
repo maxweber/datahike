@@ -50,6 +50,15 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= :remote-wal/missing-remote-store (:type (ex-data e))))))))
 
+  (testing "remote WAL rejects initial-tx instead of creating local-only seed data"
+    (let [cfg (assoc (remote-wal-config (uuid) (uuid))
+                     :initial-tx [{:db/id 1 :name "seed"}])]
+      (try
+        (dc/load-config cfg)
+        (is false "expected remote WAL initial-tx validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/unsupported-initial-tx (:type (ex-data e))))))))
+
   (testing "stores without explicit CAS support fail clearly"
     (try
       (w/cas-assoc! {} :db nil {})

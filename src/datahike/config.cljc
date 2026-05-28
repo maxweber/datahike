@@ -78,7 +78,14 @@
 (defn remote-wal-config? [config]
   (= :remote-wal (get-in config [:writer :backend])))
 
-(defn normalize-remote-wal-config [{:keys [branch writer] :as config}]
+(defn- remote-wal-initial-tx? [initial-tx]
+  (cond
+    (nil? initial-tx) false
+    (string? initial-tx) (not (str/blank? initial-tx))
+    (coll? initial-tx) (boolean (seq initial-tx))
+    :else (boolean initial-tx)))
+
+(defn normalize-remote-wal-config [{:keys [branch initial-tx writer] :as config}]
   (if-not (= :remote-wal (:backend writer))
     config
     (let [writer (merge remote-wal-defaults writer)
@@ -93,6 +100,11 @@
         (throw (ex-info "Remote WAL writer [:writer :remote-store] must be a store configuration map."
                         {:type :remote-wal/invalid-remote-store
                          :remote-store (:remote-store writer)
+                         :config config}))
+
+        (remote-wal-initial-tx? initial-tx)
+        (throw (ex-info "Remote WAL writer does not support :initial-tx yet. Apply seed data through normal transactions after create-database."
+                        {:type :remote-wal/unsupported-initial-tx
                          :config config}))
 
         (not (keyword? wal-branch))

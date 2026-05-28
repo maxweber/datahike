@@ -19,6 +19,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Remote WAL initial transaction guard** — `:remote-wal` configs now reject `:initial-tx` instead of creating seed data only in the local cache and omitting it from the remote WAL source of truth. (0.8.TODO, [#TODO])
 - **Remote WAL stale-writer catch-up** — live remote-WAL writers now reload the remote materialized checkpoint when compacted pending entries no longer contain their local commit, preventing invalid WAL summaries after materialization. (0.8.TODO, [#TODO])
 - **Remote WAL delete safety** — `delete-database` for `:remote-wal` now removes the WAL head object without deleting the containing remote store/bucket. (0.8.TODO, [#TODO])
 - **Remote WAL connection cache isolation** — existing remote-WAL connections now compare the remote store identity before reuse, preventing a shared local cache from silently returning a connection to a different WAL head. (0.8.TODO, [#TODO])
