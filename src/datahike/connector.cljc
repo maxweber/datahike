@@ -248,6 +248,57 @@
 (defmethod -connect* :self [config opts]
   (-connect-impl* config opts))
 
+(defmethod -connect* :remote-wal [config opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [_ (log/debug :datahike/connect-remote-wal {:config (update-in config [:store] dissoc :password)})
+                     store-config (:store config)
+                     store-id (ds/store-identity store-config)
+                     conn-id [store-id (:branch config)]]
+                 (if-let [conn (get-connection conn-id)]
+                   (let [conn-config (:config @(:wrapped-atom conn))
+                         cfg (normalize-config config)
+                         conn-cfg (normalize-config conn-config)]
+                     (when-not (= cfg conn-cfg)
+                       (log/raise "Configuration does not match existing connections."
+                                  {:type :config-does-not-match-existing-connections
+                                   :config cfg
+                                   :existing-connections-config conn-cfg
+                                   :diff (diff cfg conn-cfg)}))
+                     conn)
+                   (let [local-exists? (<?- (ks/store-exists? store-config opts))
+                         raw-store (<?- ((if local-exists? ks/connect-store ks/create-store)
+                                         store-config opts))
+                         store (ds/add-cache-and-handlers raw-store config)
+                         _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
+                         remote-store-config (get-in config [:writer :remote-store])
+                         raw-remote-store (<?- (ks/connect-store remote-store-config opts))
+                         remote-store (ds/add-cache-and-handlers raw-remote-store
+                                                                 (assoc config :store remote-store-config))
+                         _ (<?- (ds/ready-store (assoc remote-store-config :opts opts) remote-store))
+                         wal-key (get-in config [:writer :wal-branch])
+                         wal-read (<?- (dsi/get-wal-head-with-etag remote-store wal-key opts))
+                         _ (when-not (:exists? wal-read)
+                             (log/raise "Remote WAL head does not exist. Use create-database first."
+                                        {:type :remote-wal/head-missing
+                                         :wal-key wal-key
+                                         :config config}))
+                         wal-record (:value wal-read)
+                         _ (when-not (dsi/remote-wal-record? wal-record)
+                             (log/raise "Remote WAL head object is not a Datahike remote WAL record."
+                                        {:type :remote-wal/invalid-head
+                                         :wal-key wal-key
+                                         :value wal-record}))
+                         local-stored-db (<?- (k/get store (:branch config) nil opts))
+                         db (-> (dsi/reconstruct-db-from-wal config store remote-store wal-record local-stored-db)
+                                (assoc :remote-wal-store remote-store
+                                       :remote-wal-store-config remote-store-config))
+                         conn (conn-from-db db)]
+                     (swap! (:wrapped-atom conn) assoc :writer
+                            (w/create-writer (:writer config) conn))
+                     (add-connection! conn-id conn)
+                     conn))))))
+
 ;; public API
 
 (defn connect
@@ -287,6 +338,9 @@
                          (catch Exception e
                            (log/warn :datahike/secondary-index-close-failed {:error (.getMessage e)}))))))
              (w/shutdown (:writer db))
+             ;; Release remote WAL store handles before the local cache store.
+             (when-let [remote-store (:remote-wal-store db)]
+               (ks/release-store (:remote-wal-store-config db) remote-store))
              ;; Release the underlying store to clean up resources (memory registry, etc.)
              (ks/release-store (get-in db [:config :store]) (:store db))
              nil)))))))

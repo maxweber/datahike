@@ -35,6 +35,10 @@
 (s/def ::store-cache-size pos-int?)
 (s/def ::crypto-hash? boolean?)
 (s/def ::writer map?)
+(s/def ::remote-store map?)
+(s/def ::wal-branch keyword?)
+(s/def ::wal-auto-materialize? boolean?)
+(s/def ::wal-max-retries nat-int?)
 (s/def ::branch keyword?)
 (s/def ::entity (s/or :map associative? :vec vector?))
 (s/def ::initial-tx (s/nilable (s/or :data (s/coll-of ::entity) :path string?
@@ -65,6 +69,57 @@
                                   :opt-un [:deprecated/temporal-index :deprecated/schema-on-read]))
 
 (def self-writer {:backend :self})
+
+(def remote-wal-defaults
+  {:wal-branch *default-db-branch*
+   :wal-auto-materialize? false
+   :wal-max-retries 10})
+
+(defn remote-wal-config? [config]
+  (= :remote-wal (get-in config [:writer :backend])))
+
+(defn normalize-remote-wal-config [{:keys [branch writer] :as config}]
+  (if-not (= :remote-wal (:backend writer))
+    config
+    (let [writer (merge remote-wal-defaults writer)
+          wal-branch (:wal-branch writer)]
+      (cond
+        (nil? (:remote-store writer))
+        (throw (ex-info "Remote WAL writer requires [:writer :remote-store]."
+                        {:type :remote-wal/missing-remote-store
+                         :config config}))
+
+        (not (map? (:remote-store writer)))
+        (throw (ex-info "Remote WAL writer [:writer :remote-store] must be a store configuration map."
+                        {:type :remote-wal/invalid-remote-store
+                         :remote-store (:remote-store writer)
+                         :config config}))
+
+        (not (keyword? wal-branch))
+        (throw (ex-info "Remote WAL writer [:writer :wal-branch] must be a keyword."
+                        {:type :remote-wal/invalid-wal-branch
+                         :wal-branch wal-branch
+                         :config config}))
+
+        (not= branch wal-branch)
+        (throw (ex-info "Remote WAL writer currently supports only the configured Datahike branch."
+                        {:type :remote-wal/unsupported-branch
+                         :branch branch
+                         :wal-branch wal-branch
+                         :config config}))
+
+        (:crypto-hash? config)
+        (throw (ex-info "Remote WAL writer does not support :crypto-hash? true yet."
+                        {:type :remote-wal/unsupported-crypto-hash
+                         :config config}))
+
+        (get-in config [:online-gc :enabled?])
+        (throw (ex-info "Remote WAL writer does not support online GC yet."
+                        {:type :remote-wal/unsupported-online-gc
+                         :config config}))
+
+        :else
+        (assoc config :writer writer)))))
 
 (defn from-deprecated
   [{:keys [backend username password path host port id] :as _backend-cfg}
@@ -218,12 +273,18 @@
                                  index-config
                                  (di/default-index-config index))}
          merged-config ((comp remove-nils dt/deep-merge) config config-as-arg)
+         merged-config (normalize-remote-wal-config merged-config)
          {:keys [schema-flexibility initial-tx store attribute-refs?]} merged-config]
      ;; konserve now handles store config validation at runtime
      (when-not (s/valid? :datahike/config merged-config)
        (throw (ex-info "Invalid Datahike configuration." (s/explain-data :datahike/config merged-config))))
      (when (and attribute-refs? (= :read schema-flexibility))
        (throw (ex-info "Attribute references cannot be used with schema-flexibility ':read'." config)))
+     #?(:cljs
+        (when (remote-wal-config? merged-config)
+          (throw (ex-info "Remote WAL writer is not supported for ClojureScript backends yet."
+                          {:type :remote-wal/unsupported-cljs
+                           :config merged-config}))))
      (if (string? initial-tx)
        #?(:clj (update merged-config :initial-tx (fn [path] (-> path slurp read-string)))
           :cljs (throw (ex-info ":initial-tx from path is not supported in cljs at this time" merged-config)))
