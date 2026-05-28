@@ -39,7 +39,27 @@
       (w/cas-assoc! {} :db nil {})
       (is false "expected missing CAS helper to fail")
       (catch clojure.lang.ExceptionInfo e
-        (is (= :remote-wal/cas-unavailable (:type (ex-data e))))))))
+        (is (= :remote-wal/cas-unavailable (:type (ex-data e)))))))
+
+  (testing "non-S3 konserve default stores fail clearly"
+    (let [tmp-dir (java.nio.file.Files/createTempDirectory
+                   "datahike-remote-wal-cas"
+                   (make-array java.nio.file.attribute.FileAttribute 0))
+          store-config {:backend :file
+                        :path (str (.resolve tmp-dir "store"))
+                        :id (uuid)}
+          store (atom nil)]
+      (try
+        (reset! store (ks/create-store store-config {:sync? true}))
+        (try
+          (w/cas-assoc! @store :db nil {})
+          (is false "expected non-S3 default store CAS to fail")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= :remote-wal/cas-unavailable (:type (ex-data e))))))
+        (finally
+          (when @store
+            (ks/release-store store-config @store {:sync? true}))
+          (delete-store-quietly! store-config))))))
 
 (deftest remote-wal-local-materialization-uses-wal-commit-id
   (let [local-id (uuid)

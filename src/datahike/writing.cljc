@@ -18,6 +18,9 @@
             [datahike.online-gc :as online-gc]
             [konserve.core :as k]
             [konserve.store :as ks]
+            #?(:clj [konserve.impl.defaults :as konserve-defaults])
+            #?(:clj [konserve.impl.storage-layout :as storage-layout])
+            #?(:clj [konserve.protocols :refer [-serialize -deserialize]])
             #?(:clj [konserve.memory])
             #?(:clj [clojure.core.cache :as cache])
             [replikativ.logging :as log]
@@ -26,7 +29,9 @@
             [clojure.core.async :as async :refer [go put!]]
             [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
             [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? meta-update *default-sync-translation*]
-             #?@(:cljs [:refer-macros [async+sync]])]))
+             #?@(:cljs [:refer-macros [async+sync]])])
+  #?(:clj (:import [java.io ByteArrayInputStream ByteArrayOutputStream]
+                   [java.util Arrays])))
 
 ;; mapping to storage
 
@@ -140,42 +145,222 @@
                  :store-type (type store)}))))
 
 #?(:clj
-   (extend-type konserve.memory.MemoryStore
-     PRemoteWalCasStore
-     (-get-with-etag [store key opts]
-       (async+sync (:sync? opts) *default-sync-translation*
-                   (go-try-
-                    (let [state @(:state store)
-                          [meta value] (get state key)]
-                      {:value value
-                       :etag meta
-                       :exists? (contains? state key)}))))
-     (-cas-assoc! [store key expected-etag new-value opts]
-       (async+sync (:sync? opts) *default-sync-translation*
-                   (go-try-
-                    (let [[old-state _new-state]
-                          (swap-vals! (:state store)
-                                      (fn [state]
-                                        (let [[old-meta _old-value] (get state key)
-                                              exists? (contains? state key)
-                                              matches? (if (nil? expected-etag)
-                                                         (not exists?)
-                                                         (= expected-etag old-meta))]
-                                          (if matches?
-                                            (assoc state key [(meta-update key :edn old-meta) new-value])
-                                            state))))
-                          [old-meta _old-value] (get old-state key)
-                          existed? (contains? old-state key)
-                          won? (if (nil? expected-etag)
-                                 (not existed?)
-                                 (= expected-etag old-meta))]
-                      (if won?
-                        (do
-                          (when-let [cache-atom (:cache store)]
-                            (swap! cache-atom cache/evict key)
-                            (swap! cache-atom cache/miss key new-value))
-                          :ok)
-                        :conflict)))))))
+   (do
+     (defn- update-store-cache! [store key value exists?]
+       (when-let [cache-atom (:cache store)]
+         (swap! cache-atom cache/evict key)
+         (when exists?
+           (swap! cache-atom cache/miss key value))))
+
+     (defn- default-store-codec [store serializer compressor encryptor]
+       ((encryptor (get-in store [:config :encryptor]))
+        (compressor serializer)))
+
+     (defn- default-store-serialize [store serializer value]
+       (let [baos (ByteArrayOutputStream.)]
+         (try
+           (-serialize (default-store-codec store serializer
+                                            (:compressor store)
+                                            (:encryptor store))
+                       baos
+                       (:write-handlers store)
+                       value)
+           (.toByteArray baos)
+           (finally
+             (.close baos)))))
+
+     (defn- default-store-deserialize [store serializer compressor encryptor bytes]
+       (let [bais (ByteArrayInputStream. bytes)]
+         (try
+           (-deserialize (default-store-codec store serializer compressor encryptor)
+                         (:read-handlers store)
+                         bais)
+           (finally
+             (.close bais)))))
+
+     (defn- default-store-blob-bytes [store key old-meta value]
+       (let [serializer (get (:serializers store) (:default-serializer store))
+             meta (meta-update key :edn old-meta)
+             meta-arr (default-store-serialize store serializer meta)
+             value-arr (default-store-serialize store serializer value)
+             header (storage-layout/create-header (:version store)
+                                                  serializer
+                                                  (:compressor store)
+                                                  (:encryptor store)
+                                                  (count meta-arr))
+             baos (ByteArrayOutputStream. (+ (alength ^bytes header)
+                                             (alength ^bytes meta-arr)
+                                             (alength ^bytes value-arr)))]
+         (try
+           (.write baos ^bytes header)
+           (.write baos ^bytes meta-arr)
+           (.write baos ^bytes value-arr)
+           (.toByteArray baos)
+           (finally
+             (.close baos)))))
+
+     (defn- default-store-parse-blob [store ^bytes bytes]
+       (let [header (Arrays/copyOfRange bytes 0 storage-layout/header-size)
+             [_version serializer compressor encryptor meta-size actual-header-size]
+             (storage-layout/parse-header header (:serializers store))
+             meta-end (+ actual-header-size meta-size)
+             meta-arr (Arrays/copyOfRange bytes actual-header-size meta-end)
+             value-arr (Arrays/copyOfRange bytes meta-end (alength bytes))]
+         {:meta (default-store-deserialize store serializer compressor encryptor meta-arr)
+          :value (default-store-deserialize store serializer compressor encryptor value-arr)}))
+
+     (defn- s3-backing? [backing]
+       (and backing
+            (= "konserve_s3.core.S3Bucket" (.getName (class backing)))))
+
+     (defn- s3-raw-key [store key]
+       (str (get-in store [:backing :store-id]) "_" (konserve-defaults/key->store-key key)))
+
+     (defn- resolve-s3-var! [sym]
+       (try
+         (or (requiring-resolve sym)
+             (log/raise "konserve-s3 helper var is unavailable."
+                        {:type :remote-wal/s3-cas-unavailable
+                         :var sym}))
+         (catch Throwable e
+           (log/raise "Remote WAL S3/Tigris CAS requires konserve-s3 on the classpath."
+                      {:type :remote-wal/s3-cas-unavailable
+                       :var sym
+                       :error e}))))
+
+     (defn- s3-get-object-with-etag* [backing raw-key]
+       ((resolve-s3-var! 'konserve-s3.core/get-object-with-etag)
+        (:client backing)
+        (:bucket backing)
+        raw-key))
+
+     (defn- s3-precondition-failed? [^Throwable e]
+       (let [s3-ex-class (try
+                           (Class/forName "software.amazon.awssdk.services.s3.model.S3Exception")
+                           (catch Throwable _ nil))]
+         (boolean
+          (and s3-ex-class
+               (some (fn [^Throwable t]
+                       (and (instance? s3-ex-class t)
+                            (= 412 (clojure.lang.Reflector/invokeInstanceMethod
+                                    t "statusCode" (object-array [])))))
+                     (take-while some? (iterate #(.getCause ^Throwable %) e)))))))
+
+     (defn- s3-put-object-if-none-match [client bucket raw-key ^bytes bytes]
+       (let [put-request-class (Class/forName "software.amazon.awssdk.services.s3.model.PutObjectRequest")
+             request-body-class (Class/forName "software.amazon.awssdk.core.sync.RequestBody")
+             builder (clojure.lang.Reflector/invokeStaticMethod put-request-class "builder" (object-array []))
+             builder (clojure.lang.Reflector/invokeInstanceMethod builder "bucket" (object-array [bucket]))
+             builder (clojure.lang.Reflector/invokeInstanceMethod builder "key" (object-array [raw-key]))
+             builder (clojure.lang.Reflector/invokeInstanceMethod builder "ifNoneMatch" (object-array ["*"]))
+             request (clojure.lang.Reflector/invokeInstanceMethod builder "build" (object-array []))
+             body (clojure.lang.Reflector/invokeStaticMethod request-body-class "fromBytes" (object-array [bytes]))]
+         (try
+           (clojure.lang.Reflector/invokeInstanceMethod client "putObject" (object-array [request body]))
+           true
+           (catch Throwable e
+             (if (s3-precondition-failed? e)
+               false
+               (throw e))))))
+
+     (defn- s3-put-object-conditional* [backing raw-key ^bytes bytes expected-etag]
+       (if expected-etag
+         ((resolve-s3-var! 'konserve-s3.core/put-object-conditional)
+          (:client backing)
+          (:bucket backing)
+          raw-key
+          bytes
+          expected-etag)
+         (s3-put-object-if-none-match (:client backing) (:bucket backing) raw-key bytes)))
+
+     (defn- s3-etag-token [etag meta]
+       {:backend :s3
+        :etag etag
+        :meta meta})
+
+     (defn- s3-default-store-required! [store key]
+       (when-not (s3-backing? (:backing store))
+         (log/raise "Remote WAL CAS is only implemented for memory and S3/Tigris konserve stores."
+                    {:type :remote-wal/cas-unavailable
+                     :key key
+                     :store-type (type store)
+                     :backing-type (type (:backing store))})))
+
+     (extend-type konserve.impl.defaults.DefaultStore
+       PRemoteWalCasStore
+       (-get-with-etag [store key opts]
+         (s3-default-store-required! store key)
+         (async+sync (:sync? opts) *default-sync-translation*
+                     (go-try-
+                      (let [raw-key (s3-raw-key store key)
+                            object (s3-get-object-with-etag* (:backing store) raw-key)]
+                        (if object
+                          (let [{:keys [meta value]} (default-store-parse-blob store (:data object))]
+                            (update-store-cache! store key value true)
+                            {:value value
+                             :etag (s3-etag-token (:etag object) meta)
+                             :exists? true})
+                          (do
+                            (update-store-cache! store key nil false)
+                            {:value nil
+                             :etag nil
+                             :exists? false}))))))
+       (-cas-assoc! [store key expected-etag new-value opts]
+         (s3-default-store-required! store key)
+         (async+sync (:sync? opts) *default-sync-translation*
+                     (go-try-
+                      (let [etag (if (map? expected-etag)
+                                   (:etag expected-etag)
+                                   expected-etag)
+                            old-meta (when (map? expected-etag)
+                                       (:meta expected-etag))
+                            raw-key (s3-raw-key store key)
+                            bytes (default-store-blob-bytes store key old-meta new-value)
+                            won? (s3-put-object-conditional* (:backing store) raw-key bytes etag)]
+                        (if won?
+                          (do
+                            (update-store-cache! store key new-value true)
+                            :ok)
+                          (do
+                            (update-store-cache! store key nil false)
+                            :conflict)))))))
+
+     (extend-type konserve.memory.MemoryStore
+       PRemoteWalCasStore
+       (-get-with-etag [store key opts]
+         (async+sync (:sync? opts) *default-sync-translation*
+                     (go-try-
+                      (let [state @(:state store)
+                            [meta value] (get state key)]
+                        {:value value
+                         :etag meta
+                         :exists? (contains? state key)}))))
+       (-cas-assoc! [store key expected-etag new-value opts]
+         (async+sync (:sync? opts) *default-sync-translation*
+                     (go-try-
+                      (let [[old-state _new-state]
+                            (swap-vals! (:state store)
+                                        (fn [state]
+                                          (let [[old-meta _old-value] (get state key)
+                                                exists? (contains? state key)
+                                                matches? (if (nil? expected-etag)
+                                                           (not exists?)
+                                                           (= expected-etag old-meta))]
+                                            (if matches?
+                                              (assoc state key [(meta-update key :edn old-meta) new-value])
+                                              state))))
+                            [old-meta _old-value] (get old-state key)
+                            existed? (contains? old-state key)
+                            won? (if (nil? expected-etag)
+                                   (not existed?)
+                                   (= expected-etag old-meta))]
+                        (if won?
+                          (do
+                            (when-let [cache-atom (:cache store)]
+                              (swap! cache-atom cache/evict key)
+                              (swap! cache-atom cache/miss key new-value))
+                            :ok)
+                          :conflict))))))))
 
 (defn replay-wal-tx [db {:keys [tx-data tx-meta max-tx max-eid]}]
   (let [expected {:max-tx max-tx

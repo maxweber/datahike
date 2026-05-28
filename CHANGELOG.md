@@ -8,7 +8,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Features
 
-- **Remote WAL writer prototype** — adds an experimental `:remote-wal` writer backend with a conditional remote WAL head, concrete datom WAL entries, replay on connect, and local/remote materialization helpers. (0.8.TODO, [#TODO])
+- **Remote WAL writer prototype** — adds an experimental `:remote-wal` writer backend with a conditional remote WAL head (memory and S3/Tigris CAS), concrete datom WAL entries, replay on connect, and local/remote materialization helpers. (0.8.TODO, [#TODO])
 - **Optimistic overlay** — new `datahike.optimistic` primitive lets UIs render a transaction's effect immediately and re-fire listeners when the writer confirms (or fails). Most useful with a remote writer (e.g. KabelWriter over WebSockets). *Experimental.* (0.8.1690, [#822])
 - **Versioning API promoted** — `datahike.experimental.versioning` (introduced in late 2022) is renamed to `datahike.versioning` as part of the planner / secondary-index / versioning PR; subsequently exposed in libdatahike + pydatahike. (0.8.1664, [#795], [#831])
 - **Versioning bindings in libdatahike + pydatahike** — `branches`, `branch!`, `delete-branch!`, `merge-db`, `commit-id`, `parent-commit-ids` are now exposed in the native C and Python bindings, plus new `branch:NAME` / `commit:UUID` input formats for loading a DB at a specific branch or commit. (0.8.1689, [#831])
