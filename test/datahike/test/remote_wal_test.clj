@@ -81,6 +81,75 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-replay-preserves-schema-upsert-retractions-and-history
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (assoc (remote-wal-config local-id remote-id)
+                   :schema-flexibility :write)
+        restart-cfg (assoc (remote-wal-config restart-local-id remote-id)
+                           :schema-flexibility :write)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [schema-tx [{:db/ident :email
+                        :db/valueType :db.type/string
+                        :db/cardinality :db.cardinality/one
+                        :db/unique :db.unique/identity}
+                       {:db/ident :name
+                        :db/valueType :db.type/string
+                        :db/cardinality :db.cardinality/one}]
+            _ (d/transact @conn schema-tx)
+            add-report (d/transact @conn [{:db/id -1
+                                            :email "rob@example"
+                                            :name "Alice"}])
+            eid (get-in add-report [:tempids -1])
+            add-tx (get-in add-report [:db-after :max-tx])
+            fixed-instant (java.util.Date. 1234567890)
+            upsert-report (d/transact @conn {:tx-data [{:db/id -2
+                                                         :email "rob@example"
+                                                         :name "Alicia"}]
+                                             :tx-meta {:db/txInstant fixed-instant}})
+            upsert-tx (get-in upsert-report [:db-after :max-tx])]
+        (d/transact @conn [[:db/retract eid :name "Alicia"]])
+        (is (= fixed-instant (get-in upsert-report [:tx-meta :db/txInstant])))
+        (is (= #{[fixed-instant]}
+               (d/q '[:find ?t :in $ ?tx :where [?tx :db/txInstant ?t]]
+                    @@conn upsert-tx)))
+        (is (= #{["rob@example"]}
+               (d/q '[:find ?email :where [?e :email ?email]] @@conn)))
+        (is (= #{}
+               (d/q '[:find ?name :where [?e :name ?name]] @@conn)))
+        (is (= #{["Alice"]}
+               (d/q '[:find ?name :where [?e :name ?name]]
+                    (d/as-of @@conn add-tx))))
+
+        ;; Reconnect with a different local cache to force reconstruction from
+        ;; the remote WAL, then verify concrete replay preserved schema changes,
+        ;; upsert identity, retraction, txInstant and temporal indexes.
+        (d/release @conn)
+        (reset! conn nil)
+        (reset! restarted (d/connect restart-cfg))
+        (is (= #{[fixed-instant]}
+               (d/q '[:find ?t :in $ ?tx :where [?tx :db/txInstant ?t]]
+                    @@restarted upsert-tx)))
+        (is (= #{["rob@example"]}
+               (d/q '[:find ?email :where [?e :email ?email]] @@restarted)))
+        (is (= #{}
+               (d/q '[:find ?name :where [?e :name ?name]] @@restarted)))
+        (is (= #{["Alice"]}
+               (d/q '[:find ?name :where [?e :name ?name]]
+                    (d/as-of @@restarted add-tx)))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-remote-materialization-clears-pending
   (let [local-id (uuid)
         remote-id (uuid)
