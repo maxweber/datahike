@@ -19,6 +19,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Remote WAL CAS retry isolation** — CAS conflicts no longer clear store-level pending index writes that may belong to concurrent background materialization. (0.8.TODO, [#TODO])
 - **Remote WAL file-cache restart** — remote materialized checkpoints are localized onto the configured cache store before subsequent local materialization, so fresh file caches can transact, flush, and reconnect without retaining index roots tied to the remote store. (0.8.TODO, [#TODO])
 - **Remote WAL existence checks** — `database-exists?` now checks the remote WAL head instead of the local cache store for `:remote-wal` databases. (0.8.TODO, [#TODO])
 - **Purge propagates to secondary indices** — `:db/purge` / `:db.purge/entity` / `:db.purge/attribute` / `:db.history.purge/before` now route a retraction event (`-transact` with `:added? false`) to every secondary index covering an affected attribute, the same way normal `:db/retract` does. Previously `with-temporal-datom` bypassed `update-secondary-indices` entirely, so purged datoms silently lingered in Scriptum (full-text), Proximum (vector), and Stratum (columnar) indices — a GDPR compliance gap. ([#832])

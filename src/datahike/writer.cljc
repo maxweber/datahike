@@ -249,14 +249,17 @@
                  (reset! connection commit-db)
                  (remote-wal-materialize-later! commit-db wal-id writer-config)
                  tx-report)
-           :conflict (do
-                       (w/get-and-clear-pending-kvs! (:store base-db))
-                       (if (< attempt max-retries)
-                         (recur (inc attempt))
-                         (log/raise "Remote WAL CAS failed after maximum retries."
-                                    {:type :remote-wal/cas-retries-exhausted
-                                     :attempts (inc attempt)
-                                     :wal-key wal-key})))
+           :conflict
+           ;; Speculative remote-WAL attempts do not flush indexes, so there are
+           ;; no attempt-local pending KVs to discard here. Clearing the
+           ;; store-level pending-writes atom can race with background
+           ;; materialization from an already-won WAL entry.
+           (if (< attempt max-retries)
+                       (recur (inc attempt))
+                       (log/raise "Remote WAL CAS failed after maximum retries."
+                                  {:type :remote-wal/cas-retries-exhausted
+                                   :attempts (inc attempt)
+                                   :wal-key wal-key}))
            (log/raise "Remote WAL CAS helper returned an invalid result."
                       {:type :remote-wal/invalid-cas-result
                        :result cas-result

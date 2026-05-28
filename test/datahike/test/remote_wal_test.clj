@@ -318,6 +318,36 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-cas-conflict-preserves-existing-pending-index-writes
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [pending-writes (-> @@conn :store :storage :pending-writes)
+            sentinel [(uuid) {:remote-wal-test/sentinel true}]
+            _ (swap! pending-writes conj sentinel)
+            real-cas w/cas-assoc!
+            cas-attempts (atom 0)
+            tx-report (with-redefs [w/cas-assoc! (fn [& args]
+                                                    (if (= 1 (swap! cas-attempts inc))
+                                                      (let [ch (async/promise-chan)]
+                                                        (async/put! ch :conflict)
+                                                        ch)
+                                                      (apply real-cas args)))]
+                        (d/transact @conn [{:db/id 1 :name "Pending survives"}]))]
+        (is (map? tx-report))
+        (is (= 2 @cas-attempts))
+        (is (some #{sentinel} @pending-writes)
+            "CAS retry must not clear store-level pending writes that may belong to background materialization"))
+      (finally
+        (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-two-writers-produce-one-wal-order
   (let [local-id-a (uuid)
         local-id-b (uuid)
