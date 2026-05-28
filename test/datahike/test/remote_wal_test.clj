@@ -1,5 +1,6 @@
 (ns datahike.test.remote-wal-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.core.async :as async]
+            [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [datahike.config :as dc]
             [datahike.writing :as w]
@@ -216,6 +217,39 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-cas-conflict-retries-original-transaction
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [real-cas w/cas-assoc!
+            cas-attempts (atom 0)
+            tx-report (with-redefs [w/cas-assoc! (fn [& args]
+                                                    (if (= 1 (swap! cas-attempts inc))
+                                                      (let [ch (async/promise-chan)]
+                                                        (async/put! ch :conflict)
+                                                        ch)
+                                                      (apply real-cas args)))]
+                        (d/transact @conn [{:db/id 1 :name "Retried"}]))
+            remote-store (ks/connect-store remote-store-config {:sync? true})
+            wal-head (k/get remote-store :db nil {:sync? true})]
+        (is (map? tx-report))
+        (is (= 2 @cas-attempts))
+        (is (= #{["Retried"]}
+               (d/q '[:find ?n :where [?e :name ?n]] @@conn)))
+        (is (= 1 (count (:datahike/pending wal-head))))
+        (is (= (:datahike/wal-head wal-head)
+               (get-in tx-report [:tx-meta :db/commitId])))
+        (ks/release-store remote-store-config remote-store {:sync? true}))
+      (finally
+        (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-two-writers-produce-one-wal-order
   (let [local-id-a (uuid)
         local-id-b (uuid)
@@ -272,7 +306,8 @@
       (reset! conn (d/connect cfg))
       (let [tx-report (d/transact @conn [{:db/id 1 :name "Alice"}])
             remote-store (ks/connect-store remote-store-config {:sync? true})
-            wal-head (k/get remote-store :db nil {:sync? true})]
+            wal-head (k/get remote-store :db nil {:sync? true})
+            wal-entry (peek (:datahike/pending wal-head))]
         (is (= #{["Alice"]}
                (d/q '[:find ?n :where [?e :name ?n]] @@conn)))
         (is (w/remote-wal-record? wal-head))
@@ -280,7 +315,11 @@
         (is (= (:datahike/wal-head wal-head)
                (get-in tx-report [:tx-meta :db/commitId])))
         (is (= (:datahike/wal-head wal-head)
-               (get-in @@conn [:meta :datahike/commit-id]))))
+               (get-in @@conn [:meta :datahike/commit-id])))
+        (is (nil? (get-in wal-entry [:datahike/db-after :meta :datahike/commit-id]))
+            "WAL db-after summaries must not carry a stale parent commit id")
+        (is (= (get-in tx-report [:tx-meta :db/txInstant])
+               (get-in wal-entry [:datahike/db-after :meta :datahike/updated-at]))))
 
       ;; Use a different local cache id to prove the committed state comes from
       ;; the remote WAL, not from the first process' local snapshot.

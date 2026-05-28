@@ -65,11 +65,18 @@
 (defn wal-entry-id [entry-without-id]
   (uuid entry-without-id))
 
+(defn- wal-summary-meta [meta]
+  ;; The WAL id becomes the winning commit id only after CAS, so do not
+  ;; bake a stale parent commit id into the deterministic WAL-entry content.
+  ;; Fresh empty DB reconstruction also creates a new local DB id/created-at;
+  ;; those are not logical WAL state and should not affect replay validation.
+  (dissoc meta :datahike/commit-id :datahike/id :datahike/created-at))
+
 (defn db-summary [{:keys [max-tx max-eid hash meta]}]
   {:max-tx max-tx
    :max-eid max-eid
    :hash hash
-   :meta meta})
+   :meta (wal-summary-meta meta)})
 
 (defn build-wal-entry
   ([wal-parent writer-id tx-report]
@@ -362,14 +369,24 @@
                             :ok)
                           :conflict))))))))
 
+(defn- tx-report-modified-attrs [tx-report]
+  (let [rim (:ref-ident-map (:db-after tx-report))]
+    (into #{}
+          (comp (map :a)
+                (filter some?)
+                (map (fn [a]
+                       (if (and rim (number? a))
+                         (get rim a a)
+                         a))))
+          (:tx-data tx-report))))
+
 (defn replay-wal-tx [db {:keys [tx-data tx-meta max-tx max-eid]}]
   (let [expected {:max-tx max-tx
                   :max-eid max-eid}
         tx-report (dbt/replay-concrete-tx-data db (mapv wal->datom tx-data) tx-meta expected)
-        tx-instant (:db/txInstant tx-meta)
-        tx-report (cond-> tx-report
-                    tx-instant
-                    (assoc-in [:db-after :meta :datahike/updated-at] tx-instant))]
+        tx-report (assoc-in tx-report [:db-after :meta :datahike/updated-at]
+                             (:db/txInstant tx-meta))]
+    (dq/propagate-query-cache db (:db-after tx-report) (tx-report-modified-attrs tx-report))
     tx-report))
 
 (defn replay-wal-entry [db wal-entry]
@@ -379,10 +396,9 @@
                          (:datahike/txs wal-entry))
         db-after (assoc-in db-after [:meta :datahike/commit-id]
                            (:datahike/wal-id wal-entry))
-        expected (:datahike/db-after wal-entry)
+        expected (update (:datahike/db-after wal-entry) :meta wal-summary-meta)
         actual (db-summary db-after)]
-    (when-not (= (select-keys expected [:max-tx :max-eid :hash])
-                 (select-keys actual [:max-tx :max-eid :hash]))
+    (when-not (= expected actual)
       (log/raise "Replayed WAL entry summary does not match expected summary."
                  {:type :remote-wal/replay-summary-mismatch
                   :wal-id (:datahike/wal-id wal-entry)
@@ -890,15 +906,8 @@
                     (:remote-wal-store old)
                     (assoc :remote-wal-store (:remote-wal-store old)
                            :remote-wal-store-config (:remote-wal-store-config old)))
-        ;; Propagate query result cache from old DB to new DB
-        ;; Extract modified attributes from tx-data for selective invalidation
-        rim (:ref-ident-map db)
-        modified-attrs (into #{}
-                             (comp (map :a)
-                                   (filter some?)
-                                   (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
-                             tx-data)
-        _ (dq/propagate-query-cache old db modified-attrs)
+        ;; Propagate query result cache from old DB to new DB.
+        _ (dq/propagate-query-cache old db (tx-report-modified-attrs tx-report))
         tx-report (assoc tx-report :db-after db)]
     tx-report))
 
