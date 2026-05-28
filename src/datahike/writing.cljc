@@ -961,24 +961,29 @@
 
 (defn -database-exists?* [config]
   (let [p (dt/throwable-promise)]
-    (go
-      (put! p (try
-                (let [config (dc/load-config config)
-                      store-config (:store config)
-                      ;; First check if store exists (avoids exception when store not in registry)
-                      store-exists? (<?- (ks/store-exists? store-config {:sync? false}))]
-                  (if store-exists?
-                    ;; Store exists, now check if it contains a database
-                    (let [raw-store (<?- (ks/connect-store store-config {:sync? false}))
-                          store (ds/add-cache-and-handlers raw-store config)
-                          stored-db (<?- (k/get store :db nil {:sync? false}))]
-                      ;; Release store and await completion
-                      (<?- (ks/release-store store-config store {:sync? false}))
-                      (some? stored-db))
-                    ;; Store doesn't exist, so database doesn't exist
-                    false))
-                (catch #?(:clj Exception :cljs js/Error) e
-                  e))))
+    (go-try-
+     (put! p (try
+               (let [config (dc/load-config config)
+                     opts {:sync? false}
+                     remote-wal? (dc/remote-wal-config? config)
+                     store-config (if remote-wal?
+                                    (get-in config [:writer :remote-store])
+                                    (:store config))
+                     branch (if remote-wal?
+                              (get-in config [:writer :wal-branch])
+                              :db)
+                     exists? (if remote-wal? remote-wal-record? some?)
+                     store-exists? (<?- (ks/store-exists? store-config opts))]
+                 (if store-exists?
+                   (let [raw-store (<?- (ks/connect-store store-config opts))
+                         store (ds/add-cache-and-handlers raw-store (assoc config :store store-config))
+                         _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
+                         stored-value (<?- (k/get store branch nil opts))]
+                     (<?- (ks/release-store store-config store opts))
+                     (boolean (exists? stored-value)))
+                   false))
+               (catch #?(:clj Throwable :cljs js/Error) e
+                 e))))
     p))
 
 (defn -create-database* [config deprecated-config]

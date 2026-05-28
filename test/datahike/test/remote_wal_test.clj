@@ -73,6 +73,24 @@
             (ks/release-store store-config @store {:sync? true}))
           (delete-store-quietly! store-config))))))
 
+(deftest remote-wal-database-exists-uses-remote-head
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])]
+    (try
+      (is (false? (d/database-exists? cfg)))
+      (d/create-database cfg)
+      (is (true? (d/database-exists? cfg)))
+      (delete-store-quietly! (:store cfg))
+      (is (true? (d/database-exists? cfg))
+          "remote WAL database existence should not depend on the local cache")
+      (delete-store-quietly! remote-store-config)
+      (is (false? (d/database-exists? cfg)))
+      (finally
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-unsupported-branch-ops-fail-clearly
   (let [local-id (uuid)
         remote-id (uuid)
