@@ -3,6 +3,7 @@
             [replikativ.logging :as log]
             [datahike.core]
             [datahike.writing :as w]
+            [datahike.db.transaction :as dbt]
             [datahike.gc :as gc]
             [datahike.store :as ds]
             [datahike.config :as dc]
@@ -191,6 +192,25 @@
                 :wal-key wal-key
                 :value (:value wal-read)})))
 
+(defn- remote-wal-transaction-fn-op [entity]
+  (when (and (sequential? entity)
+             (keyword? (first entity)))
+    (let [op (first entity)]
+      (when (or (= :db.fn/call op)
+                (not (dbt/builtin-op? op)))
+        op))))
+
+(defn- validate-remote-wal-retry-safe-invocation! [op args max-retries]
+  (when (and (= 'transact! op)
+             (pos? (or max-retries 0)))
+    (let [tx-data (:tx-data (first args))
+          tx-fn-ops (not-empty (vec (distinct (keep remote-wal-transaction-fn-op tx-data))))]
+      (when tx-fn-ops
+        (log/raise "Remote WAL automatic retry does not support transaction functions yet. Set [:writer :wal-max-retries] to 0 or avoid transaction functions."
+                   {:type :remote-wal/unsupported-transaction-functions
+                    :ops tx-fn-ops
+                    :wal-max-retries max-retries})))))
+
 (defn- validate-remote-wal-tx-report! [tx-report]
   (when (seq (:secondary-indices (:db-after tx-report)))
     (log/raise "Remote WAL writer does not support secondary indexes yet."
@@ -223,6 +243,7 @@
      (when-not remote-store
        (log/raise "Remote WAL writer is missing its connected remote store."
                   {:type :remote-wal/missing-runtime-store}))
+     (validate-remote-wal-retry-safe-invocation! op args max-retries)
      (loop [attempt 0]
        (let [runtime-db @(:wrapped-atom connection)
              wal-read (<?- (w/get-wal-head-with-etag remote-store wal-key {:sync? false}))

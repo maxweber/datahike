@@ -212,6 +212,32 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-transaction-functions-fail-with-auto-retry
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (try
+        (d/transact @conn [[:db.fn/call (fn [_db]
+                                          [[:db/add 1 :name "unsafe"]])]])
+        (is false "expected remote WAL transaction function guard to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/unsupported-transaction-functions
+                 (ex-type e)))))
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (is (empty? (:datahike/pending (k/get @remote-store :db nil {:sync? true})))
+          "guarded transaction functions must not append to the remote WAL")
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-local-materialization-uses-wal-commit-id
   (let [local-id (uuid)
         remote-id (uuid)
