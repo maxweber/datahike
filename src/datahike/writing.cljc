@@ -2,8 +2,10 @@
   "Manage all state changes and access to state of durable store."
   (:require [datahike.connections :refer [delete-connection! *connections*]]
             [datahike.db :as db]
+            [datahike.db.transaction :as dbt]
             [datahike.db.utils :as dbu]
             [datahike.db.interface :as dbi]
+            [datahike.datom :as dd]
             [datahike.index :as di]
             [datahike.index.audit :as audit]
             [datahike.index.secondary :as sec]
@@ -16,12 +18,14 @@
             [datahike.online-gc :as online-gc]
             [konserve.core :as k]
             [konserve.store :as ks]
+            #?(:clj [konserve.memory])
+            #?(:clj [clojure.core.cache :as cache])
             [replikativ.logging :as log]
             [hasch.core :refer [uuid squuid]]
             [hasch.platform]
             [clojure.core.async :as async :refer [go put!]]
             [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
-            [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? *default-sync-translation*]
+            [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? meta-update *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]))
 
 ;; mapping to storage
@@ -32,6 +36,220 @@
                        :max-tx :max-eid :op-count :hash :meta]]
     (= (count (select-keys obj keys-to-check))
        (count keys-to-check))))
+
+;; ---------------------------------------------------------------------------
+;; Remote WAL helpers
+
+(declare stored->db)
+
+(def ^:const remote-wal-version 1)
+
+(defprotocol PRemoteWalCasStore
+  "Minimal conditional-write interface required by the remote WAL head."
+  (-get-with-etag [store key opts]
+    "Return {:value v :etag version :exists? boolean} for key.")
+  (-cas-assoc! [store key expected-etag new-value opts]
+    "Conditionally associate key to new-value. Returns :ok or :conflict."))
+
+(defn datom->wal [d]
+  [(:e d) (:a d) (:v d) (dd/datom-tx d) (dd/datom-added d)])
+
+(defn wal->datom [[e a v tx added?]]
+  (dd/datom e a v tx added?))
+
+(defn wal-entry-id [entry-without-id]
+  (uuid entry-without-id))
+
+(defn db-summary [{:keys [max-tx max-eid hash meta]}]
+  {:max-tx max-tx
+   :max-eid max-eid
+   :hash hash
+   :meta meta})
+
+(defn build-wal-entry
+  ([wal-parent writer-id tx-report]
+   (build-wal-entry wal-parent writer-id [tx-report] (dt/get-date)))
+  ([wal-parent writer-id tx-reports created-at]
+   (let [tx-reports (vec tx-reports)
+         db-after (:db-after (peek tx-reports))
+         entry-without-id
+         {:datahike/wal-entry? true
+          :datahike/wal-parent wal-parent
+          :datahike/writer-id writer-id
+          :datahike/created-at created-at
+          :datahike/txs
+          (mapv (fn [{:keys [tx-data tx-meta db-after]}]
+                  {:tx-data (mapv datom->wal tx-data)
+                   :tx-meta (or tx-meta {})
+                   :max-tx (:max-tx db-after)
+                   :max-eid (:max-eid db-after)})
+                tx-reports)
+          :datahike/db-after (db-summary db-after)}
+         wal-id (wal-entry-id entry-without-id)]
+     (assoc entry-without-id :datahike/wal-id wal-id))))
+
+(defn remote-wal-record? [obj]
+  (and (map? obj)
+       (true? (:datahike/remote-wal? obj))
+       (= remote-wal-version (:datahike/wal-version obj))))
+
+(defn initial-remote-wal-record [branch]
+  {:datahike/remote-wal? true
+   :datahike/wal-version remote-wal-version
+   :datahike/branch branch
+   :datahike/wal-head nil
+   :datahike/materialized-head nil
+   :datahike/materialized-db nil
+   :datahike/pending []})
+
+(defn append-wal-entry [wal-record wal-entry]
+  (when-not (remote-wal-record? wal-record)
+    (log/raise "Remote WAL head object is missing or has an unsupported format."
+               {:type :remote-wal/invalid-head
+                :wal-record wal-record}))
+  (when-not (= (:datahike/wal-head wal-record)
+               (:datahike/wal-parent wal-entry))
+    (log/raise "Remote WAL entry parent does not match current WAL head."
+               {:type :remote-wal/parent-mismatch
+                :wal-head (:datahike/wal-head wal-record)
+                :wal-parent (:datahike/wal-parent wal-entry)}))
+  (-> wal-record
+      (assoc :datahike/wal-head (:datahike/wal-id wal-entry))
+      (update :datahike/pending (fnil conj []) wal-entry)))
+
+(defn get-wal-head-with-etag
+  ([store key]
+   (get-wal-head-with-etag store key {:sync? true}))
+  ([store key opts]
+   (if (satisfies? PRemoteWalCasStore store)
+     (-get-with-etag store key opts)
+     (log/raise "Remote WAL store does not expose conditional head read/CAS operations."
+                {:type :remote-wal/cas-unavailable
+                 :key key
+                 :store-type (type store)}))))
+
+(defn cas-assoc!
+  ([store key expected-etag new-value]
+   (cas-assoc! store key expected-etag new-value {:sync? true}))
+  ([store key expected-etag new-value opts]
+   (if (satisfies? PRemoteWalCasStore store)
+     (-cas-assoc! store key expected-etag new-value opts)
+     (log/raise "Remote WAL store does not expose conditional head write/CAS operations."
+                {:type :remote-wal/cas-unavailable
+                 :key key
+                 :store-type (type store)}))))
+
+#?(:clj
+   (extend-type konserve.memory.MemoryStore
+     PRemoteWalCasStore
+     (-get-with-etag [store key opts]
+       (async+sync (:sync? opts) *default-sync-translation*
+                   (go-try-
+                    (let [state @(:state store)
+                          [meta value] (get state key)]
+                      {:value value
+                       :etag meta
+                       :exists? (contains? state key)}))))
+     (-cas-assoc! [store key expected-etag new-value opts]
+       (async+sync (:sync? opts) *default-sync-translation*
+                   (go-try-
+                    (let [[old-state _new-state]
+                          (swap-vals! (:state store)
+                                      (fn [state]
+                                        (let [[old-meta _old-value] (get state key)
+                                              exists? (contains? state key)
+                                              matches? (if (nil? expected-etag)
+                                                         (not exists?)
+                                                         (= expected-etag old-meta))]
+                                          (if matches?
+                                            (assoc state key [(meta-update key :edn old-meta) new-value])
+                                            state))))
+                          [old-meta _old-value] (get old-state key)
+                          existed? (contains? old-state key)
+                          won? (if (nil? expected-etag)
+                                 (not existed?)
+                                 (= expected-etag old-meta))]
+                      (if won?
+                        (do
+                          (when-let [cache-atom (:cache store)]
+                            (swap! cache-atom cache/evict key)
+                            (swap! cache-atom cache/miss key new-value))
+                          :ok)
+                        :conflict)))))))
+
+(defn replay-wal-tx [db {:keys [tx-data tx-meta max-tx max-eid]}]
+  (let [expected {:max-tx max-tx
+                  :max-eid max-eid}
+        tx-report (dbt/replay-concrete-tx-data db (mapv wal->datom tx-data) tx-meta expected)
+        tx-instant (:db/txInstant tx-meta)
+        tx-report (cond-> tx-report
+                    tx-instant
+                    (assoc-in [:db-after :meta :datahike/updated-at] tx-instant))]
+    tx-report))
+
+(defn replay-wal-entry [db wal-entry]
+  (let [db-after (reduce (fn [db tx]
+                           (:db-after (replay-wal-tx db tx)))
+                         db
+                         (:datahike/txs wal-entry))
+        db-after (assoc-in db-after [:meta :datahike/commit-id]
+                           (:datahike/wal-id wal-entry))
+        expected (:datahike/db-after wal-entry)
+        actual (db-summary db-after)]
+    (when-not (= (select-keys expected [:max-tx :max-eid :hash])
+                 (select-keys actual [:max-tx :max-eid :hash]))
+      (log/raise "Replayed WAL entry summary does not match expected summary."
+                 {:type :remote-wal/replay-summary-mismatch
+                  :wal-id (:datahike/wal-id wal-entry)
+                  :expected expected
+                  :actual actual}))
+    db-after))
+
+(defn replay-wal-entries [db wal-entries]
+  (reduce replay-wal-entry db wal-entries))
+
+(defn pending-wal-suffix
+  "Return the pending entries that need replay after `commit-id`."
+  [wal-record commit-id]
+  (let [pending (vec (:datahike/pending wal-record))]
+    (cond
+      (= commit-id (:datahike/wal-head wal-record)) []
+      (= commit-id (:datahike/materialized-head wal-record)) pending
+      (nil? commit-id) pending
+      :else (if-let [idx (first (keep-indexed (fn [idx entry]
+                                                (when (= commit-id (:datahike/wal-id entry)) idx))
+                                              pending))]
+              (subvec pending (inc idx))
+              (log/raise "Local DB commit is not on the remote WAL branch."
+                         {:type :remote-wal/local-head-mismatch
+                          :commit-id commit-id
+                          :wal-head (:datahike/wal-head wal-record)
+                          :materialized-head (:datahike/materialized-head wal-record)})))))
+
+(defn sync-db-to-wal-record [db wal-record]
+  (let [commit-id (get-in db [:meta :datahike/commit-id])]
+    (replay-wal-entries db (pending-wal-suffix wal-record commit-id))))
+
+(defn empty-remote-wal-db [config store]
+  (assoc (db/empty-db nil config store) :store store))
+
+(defn reconstruct-db-from-wal [config local-store remote-store wal-record local-stored-db]
+  (let [wal-head (:datahike/wal-head wal-record)
+        local-cid (get-in local-stored-db [:meta :datahike/commit-id])
+        db (cond
+             (and local-stored-db (= local-cid wal-head))
+             (stored->db (assoc local-stored-db :config config) local-store)
+
+             (and local-stored-db (= local-cid (:datahike/materialized-head wal-record)))
+             (stored->db (assoc local-stored-db :config config) local-store)
+
+             (:datahike/materialized-db wal-record)
+             (stored->db (assoc (:datahike/materialized-db wal-record) :config config)
+                         remote-store)
+
+             :else
+             (empty-remote-wal-db config local-store))]
+    (sync-db-to-wal-record db wal-record)))
 
 (defn get-and-clear-pending-kvs!
   "Retrieves and clears pending key-value pairs from the store's pending-writes atom.
@@ -348,12 +566,145 @@
 
                   db)))))
 
+(defn materialize-db-with-cid!
+  "Flush `db` to its configured store using the supplied commit id.
+
+  This is intentionally separate from `commit!`: remote-WAL mode has already
+  established the durable commit id with the remote WAL CAS and must not derive
+  a new index-content commit id while materializing a cache snapshot."
+  ([db wal-cid]
+   (materialize-db-with-cid! db wal-cid {}))
+  ([db wal-cid {:keys [store store-config branch sync? write-branch?]
+                :or {sync? true write-branch? true}}]
+   (async+sync sync? *default-sync-translation*
+               (go-try-
+                (let [store (or store (:store db))
+                      config (cond-> (:config db)
+                               store-config (assoc :store store-config)
+                               branch (assoc :branch branch))
+                      branch (when write-branch?
+                               (or branch (:branch config)))
+                      db (-> db
+                             (assoc :store store :config config)
+                             (assoc-in [:meta :datahike/commit-id] wal-cid))
+                      [schema-meta-kv-to-write db-to-store-pre] (db->stored db true)
+                      db-to-store (assoc-in db-to-store-pre [:meta :datahike/commit-id] wal-cid)
+                      pending-kvs (get-and-clear-pending-kvs! store)]
+                  (if (multi-key-capable? store)
+                    (let [[meta-key meta-val] schema-meta-kv-to-write
+                          writes-map (cond-> (into {} pending-kvs)
+                                       schema-meta-kv-to-write (assoc meta-key meta-val)
+                                       true (assoc wal-cid db-to-store)
+                                       branch (assoc branch db-to-store))]
+                      (<?- (k/multi-assoc store writes-map {:sync? sync?})))
+                    (let [[meta-key meta-val] schema-meta-kv-to-write]
+                      (when schema-meta-kv-to-write
+                        (<?- (k/assoc store meta-key meta-val {:sync? sync?})))
+                      (<?- (write-pending-kvs! store pending-kvs sync?))
+                      (<?- (k/assoc store wal-cid db-to-store {:sync? sync?}))
+                      (when branch
+                        (<?- (k/assoc store branch db-to-store {:sync? sync?})))))
+                  db)))))
+
+(defn remote-materialize-wal!
+  "Materialize the current remote WAL pending prefix into the remote store.
+
+  The WAL head object remains the only branch object at `wal-key`; the
+  Datahike stored DB snapshot is embedded back into the WAL record after all
+  referenced index KVs and the commit-log entry are durable. If concurrent
+  commits or another materializer changes the WAL head, this retries from the
+  latest head up to [:writer :wal-max-retries]."
+  ([remote-store wal-key config]
+   (remote-materialize-wal! remote-store wal-key config {:sync? true}))
+  ([remote-store wal-key config opts]
+   (let [opts (merge {:sync? true} opts)]
+     (async+sync (:sync? opts) *default-sync-translation*
+                 (go-try-
+                  (let [max-retries (get-in config [:writer :wal-max-retries] 10)
+                        remote-store-config (or (get-in config [:writer :remote-store])
+                                                (:store config))
+                        remote-config (assoc config :store remote-store-config)]
+                    (loop [attempt 0]
+                    (let [wal-read (<?- (get-wal-head-with-etag remote-store wal-key opts))]
+                      (when-not (:exists? wal-read)
+                        (log/raise "Remote WAL head does not exist."
+                                   {:type :remote-wal/head-missing
+                                    :wal-key wal-key}))
+                      (when-not (remote-wal-record? (:value wal-read))
+                        (log/raise "Remote WAL head object is not a Datahike remote WAL record."
+                                   {:type :remote-wal/invalid-head
+                                    :wal-key wal-key
+                                    :value (:value wal-read)}))
+                      (let [wal-record (:value wal-read)
+                            pending (vec (:datahike/pending wal-record))]
+                        (if (empty? pending)
+                          wal-record
+                          (let [base-db (if-let [stored-db (:datahike/materialized-db wal-record)]
+                                          (stored->db (assoc stored-db :config remote-config)
+                                                      remote-store)
+                                          (empty-remote-wal-db remote-config remote-store))
+                                target-head (:datahike/wal-id (peek pending))
+                                db-after (replay-wal-entries base-db pending)
+                                _ (when-not (= target-head (get-in db-after [:meta :datahike/commit-id]))
+                                    (log/raise "Remote WAL materialization did not replay to the expected head."
+                                               {:type :remote-wal/materialization-head-mismatch
+                                                :expected target-head
+                                                :actual (get-in db-after [:meta :datahike/commit-id])}))
+                                _ (<?- (materialize-db-with-cid! db-after target-head
+                                                                 {:store remote-store
+                                                                  :store-config remote-store-config
+                                                                  :sync? (:sync? opts)
+                                                                  :write-branch? false}))
+                                stored-db (<?- (k/get remote-store target-head nil opts))
+                                _ (when-not (stored-db? stored-db)
+                                    (log/raise "Remote WAL materialization did not write a stored DB snapshot."
+                                               {:type :remote-wal/materialization-missing-stored-db
+                                                :wal-head target-head}))
+                                fresh-read (<?- (get-wal-head-with-etag remote-store wal-key opts))
+                                fresh-record (:value fresh-read)
+                                fresh-pending (vec (:datahike/pending fresh-record))
+                                materialized-count (count pending)
+                                expected-prefix (mapv :datahike/wal-id pending)
+                                actual-prefix (mapv :datahike/wal-id
+                                                    (take materialized-count fresh-pending))]
+                            (if (= expected-prefix actual-prefix)
+                              (let [updated-record (assoc fresh-record
+                                                          :datahike/materialized-head target-head
+                                                          :datahike/materialized-db stored-db
+                                                          :datahike/pending (subvec fresh-pending materialized-count))
+                                    cas-result (<?- (cas-assoc! remote-store wal-key (:etag fresh-read)
+                                                                updated-record opts))]
+                                (case cas-result
+                                  :ok updated-record
+                                  :conflict (if (< attempt max-retries)
+                                              (recur (inc attempt))
+                                              (log/raise "Remote WAL materialization CAS failed after maximum retries."
+                                                         {:type :remote-wal/materialization-cas-retries-exhausted
+                                                          :attempts (inc attempt)
+                                                          :wal-key wal-key}))
+                                  (log/raise "Remote WAL CAS helper returned an invalid result."
+                                             {:type :remote-wal/invalid-cas-result
+                                              :result cas-result
+                                              :wal-key wal-key})))
+                              (if (< attempt max-retries)
+                                (recur (inc attempt))
+                                (log/raise "Remote WAL pending entries changed before materialization could advance."
+                                           {:type :remote-wal/materialization-prefix-mismatch
+                                            :expected expected-prefix
+                                            :actual actual-prefix
+                                            :wal-key wal-key}))))))))))))))
+
 (defn complete-db-update [old tx-report]
   (let [{:keys [writer]} old
         {:keys [db-after tx-data]
          {:keys [db/txInstant]} :tx-meta} tx-report
         new-meta  (assoc (:meta db-after) :datahike/updated-at txInstant)
-        db        (assoc db-after :meta new-meta :writer writer)
+        db        (cond-> (assoc db-after :meta new-meta :writer writer)
+                    (:store old)
+                    (assoc :store (:store old))
+                    (:remote-wal-store old)
+                    (assoc :remote-wal-store (:remote-wal-store old)
+                           :remote-wal-store-config (:remote-wal-store-config old)))
         ;; Propagate query result cache from old DB to new DB
         ;; Extract modified attributes from tx-data for selective invalidation
         rim (:ref-ident-map db)

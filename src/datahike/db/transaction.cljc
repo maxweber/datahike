@@ -1037,3 +1037,62 @@
                 upsert? (and (not (dbu/multival? db a-ident))
                              op)]
             (recur (transact-report report new-datom upsert?) entities (assoc-in migration-state [:eids e] (.-e new-datom)))))))))
+
+(defn replay-concrete-tx-data
+  "Replay concrete WAL datoms against `db` and return a tx report.
+
+  Unlike `transact-tx-data`, input is already normalized datoms with final
+  eids, attribute ids/idents, tx ids and added flags. This function therefore
+  does not allocate tempids, does not evaluate transaction functions and does
+  not inject a fresh :db/txInstant. The optional `expected-summary` map may
+  contain :max-tx, :max-eid and :hash; mismatches raise ex-info."
+  ([db concrete-datoms tx-meta]
+   (replay-concrete-tx-data db concrete-datoms tx-meta nil))
+  ([db concrete-datoms tx-meta expected-summary]
+   (when-not (sequential? concrete-datoms)
+     (log/raise "Bad concrete transaction data " concrete-datoms ", expected sequential collection of datoms"
+                {:error :replay/syntax
+                 :tx-data concrete-datoms}))
+   (let [txs (map datom-tx concrete-datoms)
+         replay-max-tx (or (:max-tx expected-summary)
+                           (when (seq txs) (apply max txs))
+                           (:max-tx db))]
+     (loop [report (-> {:db-before db
+                        :db-after  db
+                        :tx-data   []
+                        :tempids   {}
+                        :tx-meta   (or tx-meta {})}
+                       (update :db-after transient))
+            es concrete-datoms]
+       (let [[entity & entities] es]
+         (cond
+           (empty? es)
+           (let [report (-> report
+                            (assoc-in [:tempids :db/current-tx] replay-max-tx)
+                            (assoc-in [:db-after :max-tx] replay-max-tx)
+                            (update :db-after persistent!)
+                            (update :db-after finalize-secondary-indices))
+                 summary-keys (keys expected-summary)
+                 actual-summary (select-keys (:db-after report) summary-keys)]
+             (when (and expected-summary
+                        (not= (select-keys expected-summary summary-keys)
+                              actual-summary))
+               (log/raise "Replayed WAL transaction summary does not match expected summary."
+                          {:error :replay/summary-mismatch
+                           :expected (select-keys expected-summary summary-keys)
+                           :actual actual-summary}))
+             report)
+
+           (nil? entity)
+           (recur report entities)
+
+           (datom? entity)
+           (let [[e a v tx added?] entity]
+             (if added?
+               (recur (transact-add report [:db/add e a v tx]) entities)
+               (recur (transact-retract-datom report entity true) entities)))
+
+           :else
+           (log/raise "Bad concrete WAL entity " entity ", expected datahike datom"
+                      {:error :replay/syntax
+                       :tx-data entity})))))))
