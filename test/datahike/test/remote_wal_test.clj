@@ -15,8 +15,8 @@
     (ks/delete-store store-config {:sync? true})
     (catch Throwable _)))
 
-(defn- remote-wal-config [local-id remote-id]
-  {:store {:backend :memory :id local-id}
+(defn- remote-wal-config-with-store [store-config remote-id]
+  {:store store-config
    :schema-flexibility :read
    :keep-history? true
    :writer {:backend :remote-wal
@@ -24,6 +24,17 @@
             :wal-branch :db
             :wal-auto-materialize? false
             :wal-max-retries 3}})
+
+(defn- remote-wal-config [local-id remote-id]
+  (remote-wal-config-with-store {:backend :memory :id local-id} remote-id))
+
+(defn- temp-file-store-config []
+  (let [tmp-dir (java.nio.file.Files/createTempDirectory
+                 "datahike-remote-wal-local-cache"
+                 (make-array java.nio.file.attribute.FileAttribute 0))]
+    {:backend :file
+     :path (str (.resolve tmp-dir "store"))
+     :id (uuid)}))
 
 (deftest remote-wal-config-validation
   (testing "remote WAL requires an explicit durable remote store"
@@ -212,6 +223,45 @@
       (finally
         (when @conn (d/release @conn))
         (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
+(deftest remote-wal-fresh-file-cache-materializes-after-remote-checkpoint
+  (let [remote-id (uuid)
+        cfg (remote-wal-config-with-store (temp-file-store-config) remote-id)
+        restart-cfg (remote-wal-config-with-store (temp-file-store-config) remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)
+        reloaded (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Disk A"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
+      (d/release @conn)
+      (reset! conn nil)
+
+      ;; The restarted writer has an empty file cache and must localize the
+      ;; remote checkpoint before future local materialization flushes indexes.
+      (reset! restarted (d/connect restart-cfg))
+      (let [tx-report (d/transact @restarted [{:db/id 2 :name "Disk B"}])
+            wal-cid (get-in tx-report [:tx-meta :db/commitId])]
+        (w/materialize-db-with-cid! (:db-after tx-report) wal-cid {:sync? true}))
+      (d/release @restarted)
+      (reset! restarted nil)
+
+      (reset! reloaded (d/connect restart-cfg))
+      (is (= #{["Disk A"] ["Disk B"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@reloaded)))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (when @reloaded (d/release @reloaded))
         (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! (:store restart-cfg))

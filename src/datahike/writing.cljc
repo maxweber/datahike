@@ -5,6 +5,7 @@
             [datahike.db.transaction :as dbt]
             [datahike.db.utils :as dbu]
             [datahike.db.interface :as dbi]
+            [datahike.db.search :as dbs]
             [datahike.datom :as dd]
             [datahike.index :as di]
             [datahike.index.audit :as audit]
@@ -434,6 +435,44 @@
 (defn empty-remote-wal-db [config store]
   (assoc (db/empty-db nil config store) :store store))
 
+(defn- indexed-attrs-for-config [db config]
+  (if (:attribute-refs? config)
+    (set (keep (:ident-ref-map db) (get-in db [:rschema :db/index])))
+    (get-in db [:rschema :db/index])))
+
+(defn rebuild-db-indexes-for-store
+  "Rebuild primary indexes from logical datoms so `db` can use `store`.
+
+  This is used when a remote materialized checkpoint was read from one store
+  but the live connection must continue on the local cache store. Reusing the
+  deserialized index roots directly would keep their internal storage bound to
+  the source store; rebuilding gives future speculative writes and local
+  materialization attempt-local pending writes on the target store."
+  [db store config]
+  (let [current-datoms (vec (dbi/datoms db :eavt []))
+        temporal-datoms (when (:keep-history? config)
+                          (vec (dbs/search-temporal-indices db nil)))
+        index (:index config)
+        index-config (merge (:index-config config)
+                            {:indexed (indexed-attrs-for-config db config)})
+        rebuilt (assoc db
+                       :store store
+                       :config config
+                       :eavt (di/init-index index store current-datoms :eavt 0 index-config)
+                       :aevt (di/init-index index store current-datoms :aevt 0 index-config)
+                       :avet (di/init-index index store current-datoms :avet 0 index-config))]
+    (if (:keep-history? config)
+      (assoc rebuilt
+             :temporal-eavt (di/init-index index store temporal-datoms :eavt 0 index-config)
+             :temporal-aevt (di/init-index index store temporal-datoms :aevt 0 index-config)
+             :temporal-avet (di/init-index index store temporal-datoms :avet 0 index-config))
+      rebuilt)))
+
+(defn- ensure-db-store [db store config]
+  (if (identical? (:store db) store)
+    (assoc db :config config)
+    (rebuild-db-indexes-for-store db store config)))
+
 (defn reconstruct-db-from-wal [config local-store remote-store wal-record local-stored-db]
   (let [wal-head (:datahike/wal-head wal-record)
         local-cid (get-in local-stored-db [:meta :datahike/commit-id])
@@ -450,7 +489,7 @@
 
              :else
              (empty-remote-wal-db config local-store))]
-    (sync-db-to-wal-record db wal-record)))
+    (ensure-db-store (sync-db-to-wal-record db wal-record) local-store config)))
 
 (defn get-and-clear-pending-kvs!
   "Retrieves and clears pending key-value pairs from the store's pending-writes atom.
@@ -780,6 +819,7 @@
    (async+sync sync? *default-sync-translation*
                (go-try-
                 (let [store (or store (:store db))
+                      source-store (:store db)
                       config (cond-> (:config db)
                                store-config (assoc :store store-config)
                                branch (assoc :branch branch))
@@ -788,6 +828,9 @@
                       db (-> db
                              (assoc :store store :config config)
                              (assoc-in [:meta :datahike/commit-id] wal-cid))
+                      db (if (and source-store (not (identical? source-store store)))
+                           (rebuild-db-indexes-for-store db store config)
+                           db)
                       [schema-meta-kv-to-write db-to-store-pre] (db->stored db true)
                       db-to-store (assoc-in db-to-store-pre [:meta :datahike/commit-id] wal-cid)
                       pending-kvs (get-and-clear-pending-kvs! store)]
