@@ -91,6 +91,33 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-existing-connection-checks-remote-store
+  (let [shared-local-id (uuid)
+        remote-id-a (uuid)
+        remote-id-b (uuid)
+        cfg-a (remote-wal-config shared-local-id remote-id-a)
+        cfg-b-create (remote-wal-config (uuid) remote-id-b)
+        cfg-b-same-local (remote-wal-config shared-local-id remote-id-b)
+        remote-store-config-a (get-in cfg-a [:writer :remote-store])
+        remote-store-config-b (get-in cfg-b-create [:writer :remote-store])
+        conn (atom nil)]
+    (try
+      (d/create-database cfg-a)
+      (d/create-database cfg-b-create)
+      (reset! conn (d/connect cfg-a))
+      (try
+        (d/connect cfg-b-same-local)
+        (is false "expected remote WAL connection cache mismatch")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :config-does-not-match-existing-connections
+                 (:type (ex-data e))))))
+      (finally
+        (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg-a))
+        (delete-store-quietly! (:store cfg-b-create))
+        (delete-store-quietly! remote-store-config-a)
+        (delete-store-quietly! remote-store-config-b)))))
+
 (deftest remote-wal-unsupported-branch-ops-fail-clearly
   (let [local-id (uuid)
         remote-id (uuid)

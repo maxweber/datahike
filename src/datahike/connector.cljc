@@ -166,6 +166,12 @@
   (-> cfg
       (dissoc :writer :store :store-cache-size :search-cache-size)))
 
+(defn- normalize-remote-wal-connection-config [cfg]
+  (-> cfg
+      (dissoc :store :store-cache-size :search-cache-size)
+      (assoc-in [:writer :remote-store]
+                (ds/store-identity (get-in cfg [:writer :remote-store])))))
+
 (defn -connect-impl* [config opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
@@ -257,8 +263,8 @@
                      conn-id [store-id (:branch config)]]
                  (if-let [conn (get-connection conn-id)]
                    (let [conn-config (:config @(:wrapped-atom conn))
-                         cfg (normalize-config config)
-                         conn-cfg (normalize-config conn-config)]
+                         cfg (normalize-remote-wal-connection-config config)
+                         conn-cfg (normalize-remote-wal-connection-config conn-config)]
                      (when-not (= cfg conn-cfg)
                        (log/raise "Configuration does not match existing connections."
                                   {:type :config-does-not-match-existing-connections
