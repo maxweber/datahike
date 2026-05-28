@@ -61,6 +61,33 @@
             (ks/release-store store-config @store {:sync? true}))
           (delete-store-quietly! store-config))))))
 
+(deftest remote-wal-unsupported-branch-ops-fail-clearly
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        expect-unsupported-branch-op
+        (fn [f]
+          (try
+            (f)
+            (is false "expected remote WAL branch operation to fail")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= :remote-wal/unsupported-branch-operation
+                     (:type (ex-data e)))))))]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (expect-unsupported-branch-op #(d/branches @conn))
+      (expect-unsupported-branch-op #(d/branch! @conn :db :scratch))
+      (expect-unsupported-branch-op #(d/delete-branch! @conn :scratch))
+      (expect-unsupported-branch-op #(d/force-branch! @@conn :scratch #{nil}))
+      (expect-unsupported-branch-op #(d/branch-as-db @conn :db))
+      (finally
+        (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-local-materialization-uses-wal-commit-id
   (let [local-id (uuid)
         remote-id (uuid)

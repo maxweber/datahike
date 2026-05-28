@@ -2,6 +2,7 @@
   "Git-like versioning tools for Datahike.
    All operations support both synchronous (CLJ default) and asynchronous modes."
   (:require [konserve.core :as k]
+            [datahike.connector :as dc]
             [datahike.connections :refer [delete-connection!]]
             [datahike.store :refer [store-identity]]
             [datahike.writing :refer [stored->db db->stored stored-db?
@@ -17,8 +18,7 @@
             [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]
             #?(:cljs [clojure.core.async :refer [<!]]))
-  #?(:cljs (:require-macros [clojure.core.async :refer [go]]))
-  #?(:clj (:import [datahike.connector Connection])))
+  #?(:cljs (:require-macros [clojure.core.async :refer [go]])))
 
 (defn- branch-check [branch]
   (when-not (keyword? branch)
@@ -33,6 +33,28 @@
     (log/raise "You must provide at least one parent."
                {:type :must-provide-at-least-one-parent :parents parents})))
 
+(defn- connection-like? [conn-or-db]
+  #?(:clj (dc/connection? conn-or-db)
+     :cljs (or (dc/connection? conn-or-db)
+               (satisfies? IDeref conn-or-db))))
+
+(defn- remote-wal-db [conn-or-db]
+  (cond
+    (connection-like? conn-or-db)
+    @conn-or-db
+
+    (db? conn-or-db)
+    conn-or-db
+
+    :else
+    nil))
+
+(defn- remote-wal-branch-check! [conn-or-db op]
+  (when (= :remote-wal (get-in (remote-wal-db conn-or-db) [:config :writer :backend]))
+    (log/raise "Remote WAL writer does not support Datahike branch operations yet."
+               {:type :remote-wal/unsupported-branch-operation
+                :op op})))
+
 (defn- commit-id-check [commit-id]
   (when-not (uuid? commit-id)
     (log/raise "Commit-id must be a uuid."
@@ -42,7 +64,7 @@
   "Extract konserve store from a connection or db value."
   [conn-or-db]
   (cond
-    #?(:clj (instance? Connection conn-or-db) :cljs (satisfies? IDeref conn-or-db))
+    (connection-like? conn-or-db)
     (:store @conn-or-db)
 
     (db? conn-or-db)
@@ -58,6 +80,7 @@
   "List all known branch names. Returns set of keywords."
   ([conn] (branches conn {:sync? true}))
   ([conn opts]
+   (remote-wal-branch-check! conn 'branches)
    (let [store (extract-store conn)
          opts (select-keys opts [:sync?])]
      (async+sync (:sync? opts) *default-sync-translation*
@@ -68,6 +91,7 @@
   form of all stored db values. Performs backtracking and returns dbs in order.
   Always returns a channel."
   [conn]
+  (remote-wal-branch-check! conn 'branch-history)
   (let [{:keys [store] {:keys [branch]} :config} @conn]
     (go-loop-try S [[to-check & r] [branch]
                     visited #{}
@@ -89,6 +113,7 @@
    Secondary indices are CoW-branched via their native branching support."
   ([conn from new-branch] (branch! conn from new-branch {:sync? true}))
   ([conn from new-branch opts]
+   (remote-wal-branch-check! conn 'branch!)
    (let [opts (select-keys opts [:sync?])]
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
@@ -134,6 +159,7 @@
   accessible until the next gc. Remote readers need to release their connections."
   ([conn branch] (delete-branch! conn branch {:sync? true}))
   ([conn branch opts]
+   (remote-wal-branch-check! conn 'delete-branch!)
    (when (= branch :db)
      (log/raise "Cannot delete main :db branch. Delete database instead."
                 {:type :cannot-delete-main-db-branch}))
@@ -160,6 +186,7 @@
    (db-check db)
    (branch-check branch)
    (parent-check parents)
+   (remote-wal-branch-check! db 'force-branch!)
    (let [opts (select-keys opts [:sync?])
          sync? (:sync? opts)]
      (async+sync sync? *default-sync-translation*
@@ -227,6 +254,7 @@
   ([conn-or-store branch] (branch-as-db conn-or-store branch {:sync? true}))
   ([conn-or-store branch opts]
    (branch-check branch)
+   (remote-wal-branch-check! conn-or-store 'branch-as-db)
    (let [store (extract-store conn-or-store)
          opts (select-keys opts [:sync?])]
      (async+sync (:sync? opts) *default-sync-translation*
