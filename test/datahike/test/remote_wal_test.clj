@@ -15,6 +15,10 @@
     (ks/delete-store store-config {:sync? true})
     (catch Throwable _)))
 
+(defn- ex-type [^Throwable e]
+  (some (comp :type ex-data)
+        (take-while some? (iterate #(.getCause ^Throwable %) e))))
+
 (defn- remote-wal-config-with-store [store-config remote-id]
   {:store store-config
    :schema-flexibility :read
@@ -89,6 +93,40 @@
       (is (false? (d/database-exists? cfg)))
       (finally
         (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
+(deftest remote-wal-create-uses-existing-remote-store-and-cleans-conflict
+  (let [remote-id (uuid)
+        local-id-a (uuid)
+        local-id-b (uuid)
+        cfg-a (remote-wal-config local-id-a remote-id)
+        cfg-b (remote-wal-config local-id-b remote-id)
+        remote-store-config (get-in cfg-a [:writer :remote-store])
+        precreated-remote (atom nil)]
+    (try
+      ;; Tigris/S3 buckets commonly pre-exist; database creation should be
+      ;; gated by the WAL head CAS, not by creating the backing store itself.
+      (reset! precreated-remote (ks/create-store remote-store-config {:sync? true}))
+      (ks/release-store remote-store-config @precreated-remote {:sync? true})
+      (reset! precreated-remote nil)
+
+      (d/create-database cfg-a)
+      (is (true? (d/database-exists? cfg-a)))
+
+      (try
+        (d/create-database cfg-b)
+        (is false "expected existing remote WAL head to reject create-database")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/database-already-exists (ex-type e)))))
+      (is (false? (ks/store-exists? (:store cfg-b) {:sync? true}))
+          "failed remote WAL creation should remove the just-created local cache")
+      (is (true? (d/database-exists? cfg-a))
+          "failed remote WAL creation must not remove the existing remote WAL")
+      (finally
+        (when @precreated-remote
+          (ks/release-store remote-store-config @precreated-remote {:sync? true}))
+        (delete-store-quietly! (:store cfg-a))
+        (delete-store-quietly! (:store cfg-b))
         (delete-store-quietly! remote-store-config)))))
 
 (deftest remote-wal-existing-connection-checks-remote-store

@@ -362,10 +362,11 @@
       (#?(:clj deliver :cljs put!) p (<! (apply w/create-database args))))
     p))
 
-(defn- connect-remote-wal-store [config opts create?]
+(defn- connect-or-create-remote-wal-store [config opts]
   (go-try-
    (let [remote-store-config (get-in config [:writer :remote-store])
-         raw-store (<?- ((if create? ks/create-store ks/connect-store)
+         remote-exists? (<?- (ks/store-exists? remote-store-config opts))
+         raw-store (<?- ((if remote-exists? ks/connect-store ks/create-store)
                          remote-store-config opts))
          store (ds/add-cache-and-handlers raw-store (assoc config :store remote-store-config))]
      (<?- (ds/ready-store (assoc remote-store-config :opts opts) store))
@@ -374,22 +375,41 @@
 (defmethod create-database :remote-wal [& args]
   (let [p (throwable-promise)]
     (go
-      (try
-        (let [opts {:sync? false}
-              config (<! (apply w/create-database args))
-              remote-store (<! (connect-remote-wal-store config opts true))
-              wal-key (get-in config [:writer :wal-branch])
-              initial-wal (w/initial-remote-wal-record wal-key)
-              cas-result (<! (w/cas-assoc! remote-store wal-key nil initial-wal opts))]
-          (when-not (= :ok cas-result)
-            (log/raise "Remote WAL head already exists."
-                       {:type :remote-wal/database-already-exists
-                        :wal-key wal-key
-                        :cas-result cas-result}))
-          (<! (ks/release-store (get-in config [:writer :remote-store]) remote-store opts))
-          (#?(:clj deliver :cljs put!) p config))
-        (catch #?(:clj Throwable :cljs js/Error) e
-          (#?(:clj deliver :cljs put!) p e))))
+      (let [opts {:sync? false}
+            local-config (atom nil)
+            remote-store (atom nil)
+            remote-wal-created? (atom false)]
+        (try
+          (let [config (<?- (apply w/create-database args))
+                _ (reset! local-config config)
+                store (<?- (connect-or-create-remote-wal-store config opts))
+                _ (reset! remote-store store)
+                wal-key (get-in config [:writer :wal-branch])
+                initial-wal (w/initial-remote-wal-record wal-key)
+                cas-result (<?- (w/cas-assoc! store wal-key nil initial-wal opts))]
+            (when-not (= :ok cas-result)
+              (log/raise "Remote WAL head already exists."
+                         {:type :remote-wal/database-already-exists
+                          :wal-key wal-key
+                          :cas-result cas-result}))
+            (reset! remote-wal-created? true)
+            (<?- (ks/release-store (get-in config [:writer :remote-store]) store opts))
+            (#?(:clj deliver :cljs put!) p config))
+          (catch #?(:clj Throwable :cljs js/Error) e
+            (when-let [config @local-config]
+              (when-let [store @remote-store]
+                (try
+                  (<?- (ks/release-store (get-in config [:writer :remote-store]) store opts))
+                  (catch #?(:clj Throwable :cljs js/Error) release-error
+                    (log/warn :datahike/remote-wal-release-failed {:error release-error}))))
+              (when-not @remote-wal-created?
+                (try
+                  (<?- (w/delete-database config))
+                  (catch #?(:clj Throwable :cljs js/Error) cleanup-error
+                    (log/warn :datahike/remote-wal-local-create-cleanup-failed
+                              {:error cleanup-error
+                               :config config})))))
+            (#?(:clj deliver :cljs put!) p e)))))
     p))
 
 (defmulti delete-database backend-dispatch)
