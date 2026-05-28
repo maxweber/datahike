@@ -366,6 +366,56 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-stale-writer-catches-up-after-pending-compaction
+  (let [local-id-a (uuid)
+        local-id-b (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg-a (remote-wal-config local-id-a remote-id)
+        cfg-b (remote-wal-config local-id-b remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg-a [:writer :remote-store])
+        stale-conn (atom nil)
+        fresh-conn (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg-a)
+      (reset! stale-conn (d/connect cfg-a))
+      (reset! fresh-conn (d/connect cfg-b))
+      (d/transact @fresh-conn [{:db/id 1 :name "Materialized first"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg-a))
+
+      ;; `stale-conn` was still at the pre-WAL empty DB when another writer's
+      ;; entry was materialized and removed from pending. Its next transaction
+      ;; must reload the remote materialized checkpoint before speculating;
+      ;; replaying the remaining pending suffix on the empty DB would produce
+      ;; an invalid WAL summary and lose "Materialized first" locally.
+      (d/transact @stale-conn [{:db/id 2 :name "After compaction"}])
+      (is (= #{["Materialized first"] ["After compaction"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@stale-conn)))
+
+      ;; A second materialization validates that the stale writer's WAL entry
+      ;; summary was built from the caught-up DB, not from its old empty state.
+      (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg-a))
+      (d/release @stale-conn)
+      (reset! stale-conn nil)
+      (d/release @fresh-conn)
+      (reset! fresh-conn nil)
+      (reset! restarted (d/connect restart-cfg))
+      (is (= #{["Materialized first"] ["After compaction"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted)))
+      (finally
+        (when @stale-conn (d/release @stale-conn))
+        (when @fresh-conn (d/release @fresh-conn))
+        (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg-a))
+        (delete-store-quietly! (:store cfg-b))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-fresh-file-cache-materializes-after-remote-checkpoint
   (let [remote-id (uuid)
         cfg (remote-wal-config-with-store (temp-file-store-config) remote-id)

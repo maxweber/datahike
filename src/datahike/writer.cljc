@@ -250,7 +250,9 @@
              _ (validate-remote-wal-head! wal-read wal-key)
              wal-record (:value wal-read)
              base-db (remote-wal-attach-runtime
-                      (w/sync-db-to-wal-record runtime-db wal-record)
+                      (w/sync-db-to-wal-record-or-materialized runtime-db
+                                                               remote-store
+                                                               wal-record)
                       runtime-db)
              tx-report (apply op-fn base-db args)
              _ (validate-remote-wal-tx-report! tx-report)

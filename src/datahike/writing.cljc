@@ -491,6 +491,36 @@
              (empty-remote-wal-db config local-store))]
     (ensure-db-store (sync-db-to-wal-record db wal-record) local-store config)))
 
+(defn- wal-record-can-advance-db?
+  "Return true when `db`'s commit id is still represented in `wal-record`.
+
+  A nil commit id is only replayable from pending before the first remote
+  materialized checkpoint. Once pending has been compacted, a nil or older
+  local DB must reload the remote materialized DB rather than replaying the
+  remaining pending suffix on top of an empty/stale base."
+  [wal-record commit-id]
+  (cond
+    (= commit-id (:datahike/wal-head wal-record)) true
+    (= commit-id (:datahike/materialized-head wal-record)) true
+    (nil? commit-id) (nil? (:datahike/materialized-head wal-record))
+    :else (boolean (some #(= commit-id (:datahike/wal-id %))
+                         (:datahike/pending wal-record)))))
+
+(defn sync-db-to-wal-record-or-materialized
+  "Advance `db` to `wal-record`, reloading the remote materialized checkpoint
+  when pending WAL no longer contains the local commit.
+
+  This is used by live writers that can stay open while another process
+  materializes and clears WAL entries. Startup uses `reconstruct-db-from-wal`
+  directly because it may also consider a local stored snapshot."
+  [db remote-store wal-record]
+  (let [commit-id (get-in db [:meta :datahike/commit-id])]
+    (if (wal-record-can-advance-db? wal-record commit-id)
+      (sync-db-to-wal-record db wal-record)
+      (if (:datahike/materialized-db wal-record)
+        (reconstruct-db-from-wal (:config db) (:store db) remote-store wal-record nil)
+        (sync-db-to-wal-record db wal-record)))))
+
 (defn get-and-clear-pending-kvs!
   "Retrieves and clears pending key-value pairs from the store's pending-writes atom.
   Assumes :pending-writes in store's storage holds an atom of a collection of [key value] pairs."
