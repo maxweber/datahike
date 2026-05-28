@@ -417,6 +417,75 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-cas-loser-revalidates-unique-conflict-after-retry
+  (let [local-id-a (uuid)
+        local-id-b (uuid)
+        remote-id (uuid)
+        cfg-a (assoc (remote-wal-config local-id-a remote-id)
+                     :schema-flexibility :write)
+        restart-cfg (assoc (remote-wal-config (uuid) remote-id)
+                           :schema-flexibility :write)
+        cfg-b (assoc (remote-wal-config local-id-b remote-id)
+                     :schema-flexibility :write)
+        remote-store-config (get-in cfg-a [:writer :remote-store])
+        conn-a (atom nil)
+        conn-b (atom nil)
+        restarted (atom nil)]
+    (try
+      (d/create-database cfg-a)
+      (reset! conn-a (d/connect cfg-a))
+      (reset! conn-b (d/connect cfg-b))
+      (d/transact @conn-a [{:db/ident :email
+                            :db/valueType :db.type/string
+                            :db/cardinality :db.cardinality/one
+                            :db/unique :db.unique/value}])
+      (let [real-cas w/cas-assoc!
+            first-data-cas-latch (java.util.concurrent.CountDownLatch. 2)
+            data-cas-attempts (atom 0)
+            transact-dup (fn [conn eid]
+                           (future
+                             (try
+                               (d/transact conn [{:db/id eid :email "dupe@example"}])
+                               (catch Throwable e
+                                 e))))
+            [result-a result-b]
+            (with-redefs [w/cas-assoc!
+                          (fn [store key expected-etag new-value opts]
+                            (when (= 2 (count (:datahike/pending new-value)))
+                              (swap! data-cas-attempts inc)
+                              (.countDown first-data-cas-latch)
+                              (is (.await first-data-cas-latch 5 java.util.concurrent.TimeUnit/SECONDS)))
+                            (real-cas store key expected-etag new-value opts))]
+              (let [fa (transact-dup @conn-a 100)
+                    fb (transact-dup @conn-b 200)]
+                [@fa @fb]))
+            reports (filter map? [result-a result-b])
+            errors (remove map? [result-a result-b])
+            error (first errors)
+            error-message (if (instance? Throwable error)
+                            (ex-message error)
+                            (str error))
+            remote-store (ks/connect-store remote-store-config {:sync? true})
+            wal-head (k/get remote-store :db nil {:sync? true})]
+        (is (= 2 @data-cas-attempts))
+        (is (= 1 (count reports)))
+        (is (= 1 (count errors)))
+        (is (re-find #"unique constraint" (or error-message "")))
+        (is (= 2 (count (:datahike/pending wal-head)))
+            "only the schema tx and the winning data tx should be globally committed")
+        (ks/release-store remote-store-config remote-store {:sync? true})
+        (reset! restarted (d/connect restart-cfg))
+        (is (= #{["dupe@example"]}
+               (d/q '[:find ?email :where [?e :email ?email]] @@restarted))))
+      (finally
+        (when @conn-a (d/release @conn-a))
+        (when @conn-b (d/release @conn-b))
+        (when @restarted (d/release @restarted))
+        (delete-store-quietly! (:store cfg-a))
+        (delete-store-quietly! (:store cfg-b))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-single-writer-replays-from-remote
   (let [local-id (uuid)
         remote-id (uuid)
