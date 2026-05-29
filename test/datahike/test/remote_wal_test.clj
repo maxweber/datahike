@@ -875,6 +875,45 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-cas-conflict-exhaustion-discards-speculative-db
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (assoc-in (remote-wal-config local-id remote-id)
+                      [:writer :wal-max-retries]
+                      0)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [cas-attempts (atom 0)]
+        (try
+          (with-redefs [w/cas-assoc! (fn [& _args]
+                                        (swap! cas-attempts inc)
+                                        (let [ch (async/promise-chan)]
+                                          (async/put! ch :conflict)
+                                          ch))]
+            (d/transact @conn [{:db/id 1 :name "Speculative loser"}]))
+          (is false "expected remote WAL CAS exhaustion to fail")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= :remote-wal/cas-retries-exhausted (ex-type e))))
+          (finally
+            (is (= 1 @cas-attempts)
+                "wal-max-retries 0 should make exactly one CAS attempt"))))
+      (is (empty? (d/q '[:find ?n :where [?e :name ?n]] @@conn))
+          "failed CAS attempts must not publish speculative state locally")
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})]
+        (is (nil? (:datahike/wal-head wal-head)))
+        (is (empty? (:datahike/pending wal-head))
+            "failed CAS attempts must not append to the remote WAL"))
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-two-writers-produce-one-wal-order
   (let [local-id-a (uuid)
         local-id-b (uuid)
