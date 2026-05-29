@@ -182,6 +182,20 @@
     (assoc :remote-wal-store (:remote-wal-store runtime-db)
            :remote-wal-store-config (:remote-wal-store-config runtime-db))))
 
+(defn- remote-wal-commit-id [db]
+  (get-in db [:meta :datahike/commit-id]))
+
+(defn- remote-wal-publish-synced-base!
+  "Publish remote commits that are already durable before applying a local
+  speculative attempt. Validation failures must not leave the connection pinned
+  to an older WAL head."
+  [connection runtime-db base-db wal-record]
+  (let [runtime-cid (remote-wal-commit-id runtime-db)
+        base-cid (remote-wal-commit-id base-db)]
+    (when (and (not= runtime-cid base-cid)
+               (= base-cid (:datahike/wal-head wal-record)))
+      (reset! connection base-db))))
+
 (defn- remote-wal-writer-id [{:keys [config]}]
   (or (get-in config [:writer :writer-id])
       (get-in config [:store :id])
@@ -277,6 +291,7 @@
                                                                remote-store
                                                                wal-record)
                       runtime-db)
+             _ (remote-wal-publish-synced-base! connection runtime-db base-db wal-record)
              tx-report (apply op-fn base-db args)
              _ (validate-remote-wal-tx-report! tx-report)
              wal-entry (w/build-wal-entry (:datahike/wal-head wal-record)

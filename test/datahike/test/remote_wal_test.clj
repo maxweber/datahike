@@ -1451,6 +1451,42 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-failed-transaction-publishes-caught-up-head
+  (let [local-id-a (uuid)
+        local-id-b (uuid)
+        remote-id (uuid)
+        cfg-a (assoc (remote-wal-config local-id-a remote-id)
+                     :schema-flexibility :write)
+        cfg-b (assoc (remote-wal-config local-id-b remote-id)
+                     :schema-flexibility :write)
+        conn-a (atom nil)
+        conn-b (atom nil)]
+    (try
+      (d/create-database cfg-a)
+      (reset! conn-a (d/connect cfg-a))
+      (reset! conn-b (d/connect cfg-b))
+      (d/transact @conn-a [{:db/ident :email
+                            :db/valueType :db.type/string
+                            :db/cardinality :db.cardinality/one
+                            :db/unique :db.unique/value}])
+      (let [winning-report (d/transact @conn-a [{:db/id 100 :email "seen@example"}])]
+        (try
+          (d/transact @conn-b [{:db/id 200 :email "seen@example"}])
+          (is false "expected stale writer transaction to fail after catching up")
+          (catch Throwable e
+            (is (re-find #"unique constraint" (ex-message e)))))
+        (is (= #{["seen@example"]}
+               (d/q '[:find ?email :where [?e :email ?email]] @@conn-b))
+            "a validation failure after remote catch-up must not leave the connection stale")
+        (is (= (get-in winning-report [:tx-meta :db/commitId])
+               (get-in @@conn-b [:meta :datahike/commit-id]))))
+      (finally
+        (when @conn-a (d/release @conn-a))
+        (when @conn-b (d/release @conn-b))
+        (delete-store-quietly! (:store cfg-a))
+        (delete-store-quietly! (:store cfg-b))
+        (delete-store-quietly! (get-in cfg-a [:writer :remote-store]))))))
+
 (deftest remote-wal-replay-ignores-local-version-metadata
   (let [local-id (uuid)
         remote-id (uuid)
