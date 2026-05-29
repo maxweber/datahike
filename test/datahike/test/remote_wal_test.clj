@@ -363,6 +363,42 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-replay-preserves-max-eid-for-ref-only-tempids
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (assoc (remote-wal-config local-id remote-id)
+                   :schema-flexibility :write)
+        restart-cfg (assoc (remote-wal-config restart-local-id remote-id)
+                           :schema-flexibility :write)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/ident :friend
+                          :db/valueType :db.type/ref
+                          :db/cardinality :db.cardinality/one}])
+      (let [tx-report (d/transact @conn [[:db/add -1 :friend -2]])
+            expected-max-eid (get-in tx-report [:db-after :max-eid])]
+        ;; The value tempid -2 is allocated and becomes max-eid, but it has no
+        ;; datom with that eid in entity position. Replay must preserve the WAL
+        ;; summary max-eid instead of deriving it only from datom entity ids.
+        (is (= 3 expected-max-eid))
+        (d/release @conn)
+        (reset! conn nil)
+        (reset! restarted (d/connect restart-cfg))
+        (is (= expected-max-eid (:max-eid @@restarted)))
+        (is (= #{[2 3]}
+               (d/q '[:find ?e ?f :where [?e :friend ?f]] @@restarted))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-remote-materialization-clears-pending
   (let [local-id (uuid)
         remote-id (uuid)

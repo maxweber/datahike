@@ -1038,6 +1038,31 @@
                              op)]
             (recur (transact-report report new-datom upsert?) entities (assoc-in migration-state [:eids e] (.-e new-datom)))))))))
 
+(defn- advance-replay-ref-value-max-eid [report ^Datom datom]
+  (if (datom-added datom)
+    (let [db (:db-after report)
+          a (.-a datom)
+          a-ident (if (and (number? a) (:attribute-refs? (:config db)))
+                    (dbi/ident-for db a :error-on-missing)
+                    a)]
+      (cond-> report
+        (and (dbu/ref? db a-ident)
+             (number? (.-v datom)))
+        (update-in [:db-after] advance-max-eid (.-v datom))))
+    report))
+
+(defn- preserve-replay-expected-max-eid [report expected-summary]
+  (if (and expected-summary (contains? expected-summary :max-eid))
+    (let [expected-max-eid (:max-eid expected-summary)
+          actual-max-eid (get-in report [:db-after :max-eid])]
+      (when (< expected-max-eid actual-max-eid)
+        (log/raise "Replayed WAL transaction max-eid exceeds expected summary."
+                   {:error :replay/summary-mismatch
+                    :expected {:max-eid expected-max-eid}
+                    :actual {:max-eid actual-max-eid}}))
+      (assoc-in report [:db-after :max-eid] expected-max-eid))
+    report))
+
 (defn replay-concrete-tx-data
   "Replay concrete WAL datoms against `db` and return a tx report.
 
@@ -1071,7 +1096,8 @@
                             (assoc-in [:tempids :db/current-tx] replay-max-tx)
                             (assoc-in [:db-after :max-tx] replay-max-tx)
                             (update :db-after persistent!)
-                            (update :db-after finalize-secondary-indices))
+                            (update :db-after finalize-secondary-indices)
+                            (preserve-replay-expected-max-eid expected-summary))
                  summary-keys (keys expected-summary)
                  actual-summary (select-keys (:db-after report) summary-keys)]
              (when (and expected-summary
@@ -1087,10 +1113,11 @@
            (recur report entities)
 
            (datom? entity)
-           (let [[e a v tx added?] entity]
-             (if added?
-               (recur (transact-add report [:db/add e a v tx]) entities)
-               (recur (transact-retract-datom report entity true) entities)))
+           (let [[e a v tx added?] entity
+                 report' (if added?
+                           (transact-add report [:db/add e a v tx])
+                           (transact-retract-datom report entity true))]
+             (recur (advance-replay-ref-value-max-eid report' entity) entities))
 
            :else
            (log/raise "Bad concrete WAL entity " entity ", expected datahike datom"
