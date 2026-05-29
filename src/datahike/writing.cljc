@@ -118,6 +118,76 @@
    (and (remote-wal-record? obj)
         (= branch (:datahike/branch obj)))))
 
+(defn- remote-wal-structure-error [wal-record]
+  (let [materialized-head (:datahike/materialized-head wal-record)
+        materialized-db (:datahike/materialized-db wal-record)
+        materialized-db-cid (get-in materialized-db [:meta :datahike/commit-id])
+        pending-value (:datahike/pending wal-record)
+        pending (when (sequential? pending-value) (vec pending-value))]
+    (cond
+      (not (sequential? pending-value))
+      {:reason :pending-not-sequential
+       :pending pending-value}
+
+      (and materialized-head (not (stored-db? materialized-db)))
+      {:reason :materialized-db-missing
+       :materialized-head materialized-head}
+
+      (and materialized-db (not= materialized-head materialized-db-cid))
+      {:reason :materialized-head-mismatch
+       :materialized-head materialized-head
+       :materialized-db-commit-id materialized-db-cid}
+
+      (seq pending)
+      (loop [parent materialized-head
+             [entry & more] pending]
+        (cond
+          (nil? entry)
+          (when-not (= parent (:datahike/wal-head wal-record))
+            {:reason :wal-head-mismatch
+             :expected parent
+             :actual (:datahike/wal-head wal-record)})
+
+          (not (and (map? entry)
+                    (true? (:datahike/wal-entry? entry))
+                    (:datahike/wal-id entry)))
+          {:reason :invalid-pending-entry
+           :entry entry}
+
+          (not= parent (:datahike/wal-parent entry))
+          {:reason :pending-parent-mismatch
+           :expected-parent parent
+           :actual-parent (:datahike/wal-parent entry)
+           :wal-id (:datahike/wal-id entry)}
+
+          :else
+          (recur (:datahike/wal-id entry) more)))
+
+      (not= (:datahike/wal-head wal-record) materialized-head)
+      {:reason :wal-head-without-pending
+       :wal-head (:datahike/wal-head wal-record)
+       :materialized-head materialized-head})))
+
+(defn validate-remote-wal-record!
+  ([wal-record]
+   (validate-remote-wal-record! wal-record (:datahike/branch wal-record)))
+  ([wal-record branch]
+   (when-not (remote-wal-record? wal-record branch)
+     (log/raise "Remote WAL head object is not a Datahike remote WAL record for this branch."
+                {:type :remote-wal/invalid-head
+                 :wal-key branch
+                 :expected-branch branch
+                 :actual-branch (:datahike/branch wal-record)
+                 :value wal-record}))
+   (when-let [error (remote-wal-structure-error wal-record)]
+     (log/raise "Remote WAL head object is structurally inconsistent."
+                (assoc error
+                       :type :remote-wal/invalid-head
+                       :wal-key branch
+                       :branch branch
+                       :value wal-record)))
+   wal-record))
+
 (defn initial-remote-wal-record [branch]
   {:datahike/remote-wal? true
    :datahike/wal-version remote-wal-version
@@ -128,10 +198,7 @@
    :datahike/pending []})
 
 (defn append-wal-entry [wal-record wal-entry]
-  (when-not (remote-wal-record? wal-record)
-    (log/raise "Remote WAL head object is missing or has an unsupported format."
-               {:type :remote-wal/invalid-head
-                :wal-record wal-record}))
+  (validate-remote-wal-record! wal-record)
   (when-not (= (:datahike/wal-head wal-record)
                (:datahike/wal-parent wal-entry))
     (log/raise "Remote WAL entry parent does not match current WAL head."
@@ -441,6 +508,7 @@
                           :materialized-head (:datahike/materialized-head wal-record)})))))
 
 (defn sync-db-to-wal-record [db wal-record]
+  (validate-remote-wal-record! wal-record)
   (let [commit-id (get-in db [:meta :datahike/commit-id])]
     (replay-wal-entries db (pending-wal-suffix wal-record commit-id))))
 
@@ -486,6 +554,7 @@
     (rebuild-db-indexes-for-store db store config)))
 
 (defn reconstruct-db-from-wal [config local-store remote-store wal-record local-stored-db]
+  (validate-remote-wal-record! wal-record (get-in config [:writer :wal-branch]))
   (let [wal-head (:datahike/wal-head wal-record)
         local-cid (get-in local-stored-db [:meta :datahike/commit-id])
         db (cond
@@ -916,14 +985,7 @@
                         (log/raise "Remote WAL head does not exist."
                                    {:type :remote-wal/head-missing
                                     :wal-key wal-key}))
-                      (when-not (remote-wal-record? (:value wal-read) wal-key)
-                        (log/raise "Remote WAL head object is not a Datahike remote WAL record for this branch."
-                                   {:type :remote-wal/invalid-head
-                                    :wal-key wal-key
-                                    :expected-branch wal-key
-                                    :actual-branch (:datahike/branch (:value wal-read))
-                                    :value (:value wal-read)}))
-                      (let [wal-record (:value wal-read)
+                      (let [wal-record (validate-remote-wal-record! (:value wal-read) wal-key)
                             pending (vec (:datahike/pending wal-record))]
                         (if (empty? pending)
                           wal-record

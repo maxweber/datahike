@@ -456,6 +456,36 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-corrupt-materialized-checkpoint-fails-clearly
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Checkpointed"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})]
+        (k/assoc @remote-store :db (dissoc wal-head :datahike/materialized-db) {:sync? true}))
+      (try
+        (d/connect restart-cfg)
+        (is false "expected corrupt remote WAL checkpoint to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/invalid-head (:type (ex-data e))))
+          (is (= :materialized-db-missing (:reason (ex-data e))))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-stale-writer-catches-up-after-pending-compaction
   (let [local-id-a (uuid)
         local-id-b (uuid)
