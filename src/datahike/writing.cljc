@@ -1024,7 +1024,11 @@
                                                {:type :remote-wal/materialization-missing-stored-db
                                                 :wal-head target-head}))
                                 fresh-read (<?- (get-wal-head-with-etag remote-store wal-key opts))
-                                fresh-record (:value fresh-read)
+                                _ (when-not (:exists? fresh-read)
+                                    (log/raise "Remote WAL head does not exist."
+                                               {:type :remote-wal/head-missing
+                                                :wal-key wal-key}))
+                                fresh-record (validate-remote-wal-record! (:value fresh-read) wal-key)
                                 fresh-pending (vec (:datahike/pending fresh-record))
                                 materialized-count (count pending)
                                 expected-prefix (mapv :datahike/wal-id pending)

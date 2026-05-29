@@ -912,6 +912,46 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-remote-materialization-validates-fresh-head
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Fresh head validation"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [real-get w/get-wal-head-with-etag
+            reads (atom 0)
+            result (with-redefs [w/get-wal-head-with-etag
+                                  (fn [store key opts]
+                                    (let [wal-read (real-get store key opts)]
+                                      (if (= 2 (swap! reads inc))
+                                        (update wal-read :value dissoc :datahike/remote-wal?)
+                                        wal-read)))]
+                     (try
+                       (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
+                       (catch Throwable e
+                         e)))
+            wal-head (k/get @remote-store :db nil {:sync? true})]
+        (is (instance? Throwable result))
+        (is (= :remote-wal/invalid-head (ex-type result)))
+        (is (= 2 @reads))
+        (is (= 1 (count (:datahike/pending wal-head)))
+            "an invalid fresh head must not be compacted")
+        (is (nil? (:datahike/materialized-head wal-head))))
+
+      (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
+      (is (empty? (:datahike/pending (k/get @remote-store :db nil {:sync? true}))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-corrupt-entry-id-fails-clearly
   (let [local-id (uuid)
         remote-id (uuid)
