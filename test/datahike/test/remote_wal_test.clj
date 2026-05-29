@@ -1166,6 +1166,42 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-load-entities-replays-from-remote
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [tx-report @(d/load-entities @conn [[1 :name "Loaded" 536870913 true]])]
+        (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+        (let [wal-head (k/get @remote-store :db nil {:sync? true})]
+          (is (= #{["Loaded"]}
+                 (d/q '[:find ?n :where [?e :name ?n]] @@conn)))
+          (is (= 1 (count (:datahike/pending wal-head))))
+          (is (= (:datahike/wal-head wal-head)
+                 (get-in tx-report [:tx-meta :db/commitId])))))
+
+      ;; Force replay from the remote WAL into a different local cache.
+      (d/release @conn)
+      (reset! conn nil)
+      (reset! restarted (d/connect restart-cfg))
+      (is (= #{["Loaded"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted)))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-single-writer-replays-from-remote
   (let [local-id (uuid)
         remote-id (uuid)
