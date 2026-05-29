@@ -638,6 +638,48 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-replay-ignores-local-version-metadata
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Version tolerant"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})
+            drifted-head (update wal-head :datahike/pending
+                                  (fn [pending]
+                                    (mapv #(update-in % [:datahike/db-after :meta]
+                                                      merge
+                                                      {:datahike/version "future-datahike"
+                                                       :hitchhiker.tree/version "future-hht"
+                                                       :persistent.set/version "future-pss"
+                                                       :konserve/version "future-konserve"})
+                                          pending)))]
+        (k/assoc @remote-store :db drifted-head {:sync? true}))
+
+      ;; Replaying a WAL written by another Datahike/konserve version should
+      ;; validate logical DB state, not local library metadata in DB meta.
+      (d/release @conn)
+      (reset! conn nil)
+      (reset! restarted (d/connect restart-cfg))
+      (is (= #{["Version tolerant"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted)))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-single-writer-replays-from-remote
   (let [local-id (uuid)
         remote-id (uuid)

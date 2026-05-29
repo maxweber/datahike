@@ -70,8 +70,16 @@
   ;; The WAL id becomes the winning commit id only after CAS, so do not
   ;; bake a stale parent commit id into the deterministic WAL-entry content.
   ;; Fresh empty DB reconstruction also creates a new local DB id/created-at;
-  ;; those are not logical WAL state and should not affect replay validation.
-  (dissoc meta :datahike/commit-id :datahike/id :datahike/created-at))
+  ;; library versions can legitimately change between WAL append and replay.
+  ;; These are not logical WAL state and should not affect replay validation.
+  (dissoc meta
+          :datahike/commit-id
+          :datahike/id
+          :datahike/created-at
+          :datahike/version
+          :hitchhiker.tree/version
+          :persistent.set/version
+          :konserve/version))
 
 (defn db-summary [{:keys [max-tx max-eid hash meta]}]
   {:max-tx max-tx
