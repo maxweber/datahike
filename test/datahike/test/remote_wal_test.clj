@@ -40,6 +40,16 @@
      :path (str (.resolve tmp-dir "store"))
      :id (uuid)}))
 
+(defn- wait-until [pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (>= (System/currentTimeMillis) deadline) false
+        :else (do
+                (Thread/sleep 10)
+                (recur))))))
+
 (deftest remote-wal-config-validation
   (testing "remote WAL requires an explicit durable remote store"
     (let [cfg {:store {:backend :memory :id (uuid)}
@@ -311,6 +321,53 @@
         (when @conn (d/release @conn))
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
+
+(deftest remote-wal-auto-materialization-is-serialized
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (assoc-in (remote-wal-config local-id remote-id)
+                      [:writer :wal-auto-materialize?]
+                      true)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        active (atom 0)
+        started (atom 0)
+        remote-finished (atom 0)
+        max-active (atom 0)
+        conn (atom nil)]
+    (with-redefs [w/materialize-db-with-cid!
+                  (fn [& _]
+                    (async/thread
+                      (let [n (swap! active inc)]
+                        (swap! max-active #(max % n))
+                        (swap! started inc)
+                        (try
+                          (Thread/sleep 150)
+                          (finally
+                            (swap! active dec))))))
+                  w/remote-materialize-wal!
+                  (fn [& _]
+                    (async/thread
+                      (swap! remote-finished inc)
+                      nil))]
+      (try
+        (d/create-database cfg)
+        (reset! conn (d/connect cfg))
+        (d/transact @conn [{:db/id 1 :name "Auto materialize A"}])
+        (is (wait-until #(pos? @active) 2000)
+            "first materialization should start")
+        (d/transact @conn [{:db/id 2 :name "Auto materialize B"}])
+        (is (wait-until #(>= @started 2) 5000)
+            "second materialization should eventually run")
+        (is (wait-until #(zero? @active) 5000)
+            "all materialization jobs should finish")
+        (is (wait-until #(>= @remote-finished 2) 5000)
+            "all remote materialization hooks should finish")
+        (is (= 1 @max-active)
+            "auto materialization should run one job at a time per writer")
+        (finally
+          (when @conn (d/release @conn))
+          (delete-store-quietly! (:store cfg))
+          (delete-store-quietly! remote-store-config))))))
 
 (deftest remote-wal-replay-preserves-schema-upsert-retractions-and-history
   (let [local-id (uuid)

@@ -34,7 +34,8 @@
     thread)
   (-streaming? [_] streaming?))
 
-(defrecord RemoteWalWriter [thread streaming? transaction-queue-size transaction-queue]
+(defrecord RemoteWalWriter [thread streaming? transaction-queue-size transaction-queue
+                            materialization-queue-size materialization-queue materialization-thread]
   PWriter
   (-dispatch! [_ arg-map]
     (let [p (promise-chan)]
@@ -42,7 +43,12 @@
       p))
   (-shutdown [_]
     (close! transaction-queue)
-    thread)
+    (when materialization-queue
+      (close! materialization-queue))
+    (go
+      (<! thread)
+      (when materialization-thread
+        (<! materialization-thread))))
   (-streaming? [_] streaming?))
 
 (def ^:const DEFAULT_QUEUE_SIZE 120000)
@@ -212,15 +218,27 @@
     (log/raise "Remote WAL writer does not support secondary indexes yet."
                {:type :remote-wal/unsupported-secondary-index})))
 
-(defn- remote-wal-materialize-later! [commit-db wal-id writer-config]
-  (when (:wal-auto-materialize? writer-config)
-    (go-try S
+(defn- remote-wal-materialize-now! [commit-db wal-id writer-config]
+  (go-try S
+          (try
             (<?- (w/materialize-db-with-cid! commit-db wal-id {:sync? false}))
             (when-let [remote-store (:remote-wal-store commit-db)]
               (<?- (w/remote-materialize-wal! remote-store
                                               (:wal-branch writer-config)
                                               (:config commit-db)
-                                              {:sync? false}))))))
+                                              {:sync? false})))
+            (catch #?(:clj Throwable :cljs js/Error) e
+              (log/error :datahike/remote-wal-materialization-error
+                         {:wal-id wal-id
+                          :error e})))))
+
+(defn- remote-wal-materialize-later! [commit-db wal-id writer-config]
+  (when (:wal-auto-materialize? writer-config)
+    (if-let [materialization-queue (:materialization-queue (:writer commit-db))]
+      (put! materialization-queue {:commit-db commit-db
+                                   :wal-id wal-id
+                                   :writer-config writer-config})
+      (remote-wal-materialize-now! commit-db wal-id writer-config))))
 
 (defn- remote-wal-apply-once!
   [connection invocation]
@@ -314,6 +332,33 @@
                     (recur))
                   (log/debug :datahike/remote-wal-writer-closed "Remote WAL writer thread gracefully closed")))))]))
 
+(defn create-remote-wal-materialization-thread
+  "Creates a per-writer materialization worker.
+
+  Remote-WAL commits are acknowledged after the CAS wins, but index flushing
+  still uses store-level pending-write buffers. Keep those asynchronous flushes
+  serialized for this writer so one materialization cannot clear another one's
+  pending KVs."
+  [materialization-queue-size]
+  (let [materialization-queue-buffer (buffer materialization-queue-size)
+        materialization-queue (chan materialization-queue-buffer)]
+    [materialization-queue
+     (#?(:clj thread-try :cljs try)
+      S
+      (go-try S
+              (loop []
+                (if-let [{:keys [commit-db wal-id writer-config]} (<?- materialization-queue)]
+                  (do
+                    (when (> (count materialization-queue-buffer) (* 0.9 materialization-queue-size))
+                      (log/warn :datahike/materialization-queue-pressure
+                                "Remote WAL materialization queue buffer >90% full"
+                                {:count (count materialization-queue-buffer)
+                                 :size materialization-queue-size}))
+                    (<?- (remote-wal-materialize-now! commit-db wal-id writer-config))
+                    (recur))
+                  (log/debug :datahike/remote-wal-materialization-closed
+                             "Remote WAL materialization thread gracefully closed")))))]))
+
 ;; public API to internal mapping
 (def default-write-fn-map {'transact!     w/transact!
                            'load-entities w/load-entities
@@ -350,12 +395,18 @@
       :streaming? true})))
 
 (defmethod create-writer :remote-wal
-  [{:keys [transaction-queue-size]} connection]
+  [{:keys [transaction-queue-size materialization-queue-size]} connection]
   (let [transaction-queue-size (or transaction-queue-size DEFAULT_QUEUE_SIZE)
-        [transaction-queue thread] (create-remote-wal-thread connection transaction-queue-size)]
+        materialization-queue-size (or materialization-queue-size DEFAULT_QUEUE_SIZE)
+        [transaction-queue thread] (create-remote-wal-thread connection transaction-queue-size)
+        [materialization-queue materialization-thread]
+        (create-remote-wal-materialization-thread materialization-queue-size)]
     (map->RemoteWalWriter
      {:transaction-queue transaction-queue
       :transaction-queue-size transaction-queue-size
+      :materialization-queue materialization-queue
+      :materialization-queue-size materialization-queue-size
+      :materialization-thread materialization-thread
       :thread thread
       :streaming? true})))
 
