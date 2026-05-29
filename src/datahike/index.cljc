@@ -3,21 +3,57 @@
   (:require [datahike.index.interface :as di]
             [datahike.index.persistent-set]))
 
-;; Aliases for protocol functions
+;; Wrappers for protocol functions. Keep these as forwarding functions rather
+;; than value aliases so protocol extensions loaded after this namespace (for
+;; example the optional hitchhiker-tree index) are visible to callers here.
 
-(def -all di/-all)
-(def -seq di/-seq)
-(def -count di/-count)
-(def -insert di/-insert)
-(def -temporal-insert di/-temporal-insert)
-(def -upsert di/-upsert)
-(def -temporal-upsert di/-temporal-upsert)
-(def -remove di/-remove)
-(def -slice di/-slice)
-(def -flush di/-flush)
-(def -transient di/-transient)
-(def -persistent! di/-persistent!)
-(def -mark di/-mark)
+(defn -all [index]
+  (di/-all index))
+
+(defn -seq [index]
+  (di/-seq index))
+
+(defn -count [index]
+  (di/-count index))
+
+(defn -insert [index datom index-type op-count]
+  (di/-insert index datom index-type op-count))
+
+(defn -temporal-insert [index datom index-type op-count]
+  (di/-temporal-insert index datom index-type op-count))
+
+(defn -upsert [index datom index-type op-count old-datom]
+  (di/-upsert index datom index-type op-count old-datom))
+
+(defn -temporal-upsert [index datom index-type op-count old-datom]
+  (di/-temporal-upsert index datom index-type op-count old-datom))
+
+(defn -remove [index datom index-type op-count]
+  (di/-remove index datom index-type op-count))
+
+(defn -slice [index from to index-type]
+  (di/-slice index from to index-type))
+
+(defn -lookup [index key cmp]
+  (di/-lookup index key cmp))
+
+(defn -count-slice [index from to cmp]
+  (di/-count-slice index from to cmp))
+
+(defn -has-subtree-counts? [index]
+  (di/-has-subtree-counts? index))
+
+(defn -flush [index backend]
+  (di/-flush index backend))
+
+(defn -transient [index]
+  (di/-transient index))
+
+(defn -persistent! [index]
+  (di/-persistent! index))
+
+(defn -mark [index]
+  (di/-mark index))
 
 ;; Aliases for multimethods
 

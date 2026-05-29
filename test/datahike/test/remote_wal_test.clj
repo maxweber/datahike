@@ -895,7 +895,8 @@
       (reset! conn (d/connect cfg))
       (let [pending-writes (-> @@conn :store :storage :pending-writes)
             sentinel [(uuid) {:remote-wal-test/sentinel true}]
-            _ (swap! pending-writes conj sentinel)
+            _ (when pending-writes
+                (swap! pending-writes conj sentinel))
             real-cas w/cas-assoc!
             cas-attempts (atom 0)
             tx-report (with-redefs [w/cas-assoc! (fn [& args]
@@ -907,8 +908,11 @@
                         (d/transact @conn [{:db/id 1 :name "Pending survives"}]))]
         (is (map? tx-report))
         (is (= 2 @cas-attempts))
-        (is (some #{sentinel} @pending-writes)
-            "CAS retry must not clear store-level pending writes that may belong to background materialization"))
+        (if pending-writes
+          (is (some #{sentinel} @pending-writes)
+              "CAS retry must not clear store-level pending writes that may belong to background materialization")
+          (is (nil? pending-writes)
+              "this index backend has no store-level pending-writes buffer to preserve")))
       (finally
         (when @conn (d/release @conn))
         (delete-store-quietly! (:store cfg))

@@ -88,6 +88,64 @@
     :eavt [(.-e datom) (.-a datom) (.-v datom) (.-tx datom)]
     (throw (IllegalArgumentException. (str "Unknown index-type: " index-type)))))
 
+(defn- node->datom [node index-type]
+  (apply (index-type->datom-fn index-type) node))
+
+(defn- lookup-start-node [^Datom datom index-type]
+  (let [[a b c d] (diu/datom-to-vec datom index-type true)]
+    [a b c d]))
+
+(defn- lookup-comparator->index-type [cmp]
+  (cond
+    (identical? cmp dd/cmp-datoms-eavt-replace) :eavt
+    (identical? cmp dd/cmp-datoms-aevt-replace) :aevt
+    ;; AV-only is a native AVET prefix. AVET replace compares (a,e), which is
+    ;; not a prefix of the physical (a,v,e,tx) ordering and must use fallback.
+    (identical? cmp dd/cmp-datoms-av-only) :avet
+    :else nil))
+
+(defn- infer-count-slice-index-type [^Datom from ^Datom to cmp]
+  (or (lookup-comparator->index-type cmp)
+      (cond
+        ;; Entity-only or entity+attribute ranges are served by EAVT.
+        (= (.-e from) (.-e to)) :eavt
+
+        ;; Attribute-only ranges use AEVT in the query estimator.
+        (and (= e0 (.-e from))
+             (= emax (.-e to))
+             (= (.-a from) (.-a to))
+             (nil? (.-v from))
+             (nil? (.-v to))) :aevt
+
+        :else nil)))
+
+(defn- lookup-datom [tree ^Datom key cmp]
+  (if-let [index-type (lookup-comparator->index-type cmp)]
+    (when-let [entry (first (hmsg/lookup-fwd-iter tree (lookup-start-node key index-type)))]
+      (let [datom (node->datom (.key ^AMapEntry entry) index-type)]
+        (when (zero? (cmp key datom))
+          datom)))
+    ;; Conservative fallback for callers with a custom comparator. This is
+    ;; intentionally linear and tries each HHT physical key layout because the
+    ;; protocol does not carry the logical index type into -lookup.
+    (first
+     (for [entry (hmsg/lookup-fwd-iter tree [])
+           index-type [:eavt :aevt :avet]
+           :let [datom (node->datom (.key ^AMapEntry entry) index-type)]
+           :when (zero? (cmp key datom))]
+       datom))))
+
+(defn- count-slice [tree from to cmp]
+  (if-let [index-type (infer-count-slice-index-type from to cmp)]
+    (count (slice tree from to index-type))
+    ;; Fallback for uncommon custom comparators. HHT does not expose subtree
+    ;; counts here, so this remains an O(n) estimate helper.
+    (count
+     (filter (fn [datom]
+               (and (not (pos? (cmp from datom)))
+                    (not (pos? (cmp datom to)))))
+             (all-datoms tree :eavt)))))
+
 (defn- index-type->indices [index-type]
   (case index-type
     :eavt [0 1]
@@ -141,6 +199,12 @@
     (remove-datom tree datom index-type op-count))
   (-slice [tree from to index-type]
     (slice tree from to index-type))
+  (-lookup [tree key cmp]
+    (lookup-datom tree key cmp))
+  (-count-slice [tree from to cmp]
+    (count-slice tree from to cmp))
+  (-has-subtree-counts? [_tree]
+    false)
   (-flush [tree backend]
     (flush-tree tree backend))
   (-transient [tree]
@@ -170,6 +234,12 @@
     (remove-datom tree datom index-type op-count))
   (-slice [tree from to index-type]
     (slice tree from to index-type))
+  (-lookup [tree key cmp]
+    (lookup-datom tree key cmp))
+  (-count-slice [tree from to cmp]
+    (count-slice tree from to cmp))
+  (-has-subtree-counts? [_tree]
+    false)
   (-flush [tree backend]
     (flush-tree tree backend))
   (-transient [tree]
