@@ -20,7 +20,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 ### Notable fixes
 
 - **Remote WAL materialization serialization** — automatic remote-WAL materialization now runs through a per-writer queue, preventing concurrent background flushes from racing on store-level pending index writes. (0.8.TODO, [#TODO])
-- **Remote WAL checkpoint validation** — remote-WAL connect/materialization now reject structurally inconsistent materialized checkpoints instead of reconstructing from an incomplete source of truth. (0.8.TODO, [#TODO])
+- **Remote WAL checkpoint validation** — remote-WAL connect/materialization now reject structurally inconsistent or unanchored materialized checkpoints instead of reconstructing from an incomplete source of truth. (0.8.TODO, [#TODO])
 - **Remote WAL empty initial transactions** — empty `:initial-tx` values are now treated as absent in `:remote-wal` configs, avoiding an unexpected no-op WAL entry during database creation. (0.8.TODO, [#TODO])
 - **Remote WAL branch validation** — remote WAL heads whose embedded branch does not match the configured WAL branch are now rejected instead of being treated as the current database. (0.8.TODO, [#TODO])
 - **Remote WAL initial transaction guard** — `:remote-wal` configs now reject `:initial-tx` instead of creating seed data only in the local cache and omitting it from the remote WAL source of truth. (0.8.TODO, [#TODO])

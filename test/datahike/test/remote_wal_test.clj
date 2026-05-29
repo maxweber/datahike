@@ -529,13 +529,26 @@
       (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
       (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
       (let [wal-head (k/get @remote-store :db nil {:sync? true})]
-        (k/assoc @remote-store :db (dissoc wal-head :datahike/materialized-db) {:sync? true}))
-      (try
-        (d/connect restart-cfg)
-        (is false "expected corrupt remote WAL checkpoint to fail")
-        (catch clojure.lang.ExceptionInfo e
-          (is (= :remote-wal/invalid-head (:type (ex-data e))))
-          (is (= :materialized-db-missing (:reason (ex-data e))))))
+        (k/assoc @remote-store :db (dissoc wal-head :datahike/materialized-db) {:sync? true})
+        (try
+          (d/connect restart-cfg)
+          (is false "expected corrupt remote WAL checkpoint to fail")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= :remote-wal/invalid-head (:type (ex-data e))))
+            (is (= :materialized-db-missing (:reason (ex-data e))))))
+
+        (k/assoc @remote-store :db
+                 (-> wal-head
+                     (assoc :datahike/materialized-head nil)
+                     (update-in [:datahike/materialized-db :meta]
+                                dissoc :datahike/commit-id))
+                 {:sync? true})
+        (try
+          (d/connect restart-cfg)
+          (is false "expected unanchored remote WAL checkpoint to fail")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= :remote-wal/invalid-head (:type (ex-data e))))
+            (is (= :materialized-head-missing (:reason (ex-data e)))))))
       (finally
         (when @conn (d/release @conn))
         (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))

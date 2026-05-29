@@ -133,6 +133,10 @@
       {:reason :materialized-db-missing
        :materialized-head materialized-head}
 
+      (and materialized-db (nil? materialized-head))
+      {:reason :materialized-head-missing
+       :materialized-db-commit-id materialized-db-cid}
+
       (and materialized-db (not= materialized-head materialized-db-cid))
       {:reason :materialized-head-mismatch
        :materialized-head materialized-head
