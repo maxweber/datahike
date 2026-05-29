@@ -102,6 +102,24 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= :remote-wal/unsupported-branch (:type (ex-data e))))))))
 
+  (testing "remote WAL validates retry and materialization options"
+    (let [invalid-auto-materialize (assoc-in (remote-wal-config (uuid) (uuid))
+                                             [:writer :wal-auto-materialize?]
+                                             :yes)
+          invalid-max-retries (assoc-in (remote-wal-config (uuid) (uuid))
+                                        [:writer :wal-max-retries]
+                                        -1)]
+      (try
+        (dc/load-config invalid-auto-materialize)
+        (is false "expected remote WAL auto-materialization validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/invalid-wal-auto-materialize (:type (ex-data e))))))
+      (try
+        (dc/load-config invalid-max-retries)
+        (is false "expected remote WAL max-retries validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/invalid-wal-max-retries (:type (ex-data e))))))))
+
   (testing "remote WAL rejects unsupported audit and online-GC modes"
     (let [crypto-cfg (assoc (remote-wal-config (uuid) (uuid))
                             :crypto-hash? true)

@@ -113,6 +113,18 @@
                          :wal-branch wal-branch
                          :config config}))
 
+        (not (boolean? (:wal-auto-materialize? writer)))
+        (throw (ex-info "Remote WAL writer [:writer :wal-auto-materialize?] must be a boolean."
+                        {:type :remote-wal/invalid-wal-auto-materialize
+                         :wal-auto-materialize? (:wal-auto-materialize? writer)
+                         :config config}))
+
+        (not (nat-int? (:wal-max-retries writer)))
+        (throw (ex-info "Remote WAL writer [:writer :wal-max-retries] must be a non-negative integer."
+                        {:type :remote-wal/invalid-wal-max-retries
+                         :wal-max-retries (:wal-max-retries writer)
+                         :config config}))
+
         (not= branch wal-branch)
         (throw (ex-info "Remote WAL writer currently supports only the configured Datahike branch."
                         {:type :remote-wal/unsupported-branch
