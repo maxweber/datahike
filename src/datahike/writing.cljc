@@ -566,16 +566,39 @@
     (assoc db :config config)
     (rebuild-db-indexes-for-store db store config)))
 
+(defn- wal-summary-for-commit [wal-record commit-id]
+  (when commit-id
+    (or (when (= commit-id (:datahike/materialized-head wal-record))
+          (some-> (:datahike/materialized-db wal-record) db-summary))
+        (some (fn [entry]
+                (when (= commit-id (:datahike/wal-id entry))
+                  (update (:datahike/db-after entry) :meta wal-summary-meta)))
+              (:datahike/pending wal-record)))))
+
+(defn- local-stored-db-matches-wal-summary? [local-stored-db wal-record commit-id]
+  (when (and local-stored-db commit-id)
+    (let [expected (wal-summary-for-commit wal-record commit-id)
+          actual (db-summary local-stored-db)]
+      (if (= expected actual)
+        true
+        (do
+          (log/warn :datahike/remote-wal-local-cache-summary-mismatch
+                    {:commit-id commit-id
+                     :expected expected
+                     :actual actual})
+          false)))))
+
 (defn reconstruct-db-from-wal [config local-store remote-store wal-record local-stored-db]
   (validate-remote-wal-record! wal-record (get-in config [:writer :wal-branch]))
   (let [wal-head (:datahike/wal-head wal-record)
+        materialized-head (:datahike/materialized-head wal-record)
         local-cid (get-in local-stored-db [:meta :datahike/commit-id])
+        local-matches? #(local-stored-db-matches-wal-summary? local-stored-db wal-record %)
         db (cond
-             (and local-stored-db wal-head (= local-cid wal-head))
+             (and wal-head (= local-cid wal-head) (local-matches? wal-head))
              (stored->db (assoc local-stored-db :config config) local-store)
 
-             (and local-stored-db (:datahike/materialized-head wal-record)
-                  (= local-cid (:datahike/materialized-head wal-record)))
+             (and materialized-head (= local-cid materialized-head) (local-matches? materialized-head))
              (stored->db (assoc local-stored-db :config config) local-store)
 
              (:datahike/materialized-db wal-record)

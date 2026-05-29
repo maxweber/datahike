@@ -533,6 +533,37 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-restart-ignores-local-cache-with-mismatched-summary
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [tx-report (d/transact @conn [{:db/id 1 :name "Committed remote"}])
+            wal-cid (get-in tx-report [:tx-meta :db/commitId])
+            ;; Simulate a local cache snapshot that claims the winning WAL cid
+            ;; but contains non-WAL state. Startup must validate the cached
+            ;; summary against the remote WAL before trusting it.
+            leaked-db (:db-after (core/with (:db-after tx-report)
+                                            [{:db/id 2 :name "Leaked local"}]))]
+        (w/materialize-db-with-cid! leaked-db wal-cid {:sync? true}))
+      (d/release @conn)
+      (reset! conn nil)
+
+      (reset! restarted (d/connect cfg))
+      (is (= #{["Committed remote"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted))
+          "remote WAL recovery must ignore local snapshots whose summary differs from the WAL")
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-restart-uses-local-materialized-head-without-replay
   (let [remote-id (uuid)
         cfg (remote-wal-config-with-store (temp-file-store-config) remote-id)
