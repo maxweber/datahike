@@ -680,6 +680,45 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-corrupt-entry-id-fails-clearly
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Entry id"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})
+            tampered-id (uuid)
+            tampered-entry (assoc (first (:datahike/pending wal-head))
+                                  :datahike/wal-id tampered-id)]
+        ;; Keep the parent chain and wal-head self-consistent; validation must
+        ;; still reject because the WAL id is no longer the deterministic hash
+        ;; of the entry content.
+        (k/assoc @remote-store :db
+                 (assoc wal-head
+                        :datahike/wal-head tampered-id
+                        :datahike/pending [tampered-entry])
+                 {:sync? true})
+        (try
+          (d/connect restart-cfg)
+          (is false "expected tampered remote WAL entry id to fail")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= :remote-wal/invalid-head (:type (ex-data e))))
+            (is (= :wal-entry-id-mismatch (:reason (ex-data e)))))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-corrupt-materialized-checkpoint-fails-clearly
   (let [local-id (uuid)
         remote-id (uuid)

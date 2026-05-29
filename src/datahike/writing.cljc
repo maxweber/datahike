@@ -63,9 +63,6 @@
 (defn wal->datom [[e a v tx added?]]
   (dd/datom e a v tx added?))
 
-(defn wal-entry-id [entry-without-id]
-  (uuid entry-without-id))
-
 (defn- wal-summary-meta [meta]
   ;; The WAL id becomes the winning commit id only after CAS, so do not
   ;; bake a stale parent commit id into the deterministic WAL-entry content.
@@ -80,6 +77,12 @@
           :hitchhiker.tree/version
           :persistent.set/version
           :konserve/version))
+
+(defn- wal-entry-id-content [entry-without-id]
+  (update-in entry-without-id [:datahike/db-after :meta] wal-summary-meta))
+
+(defn wal-entry-id [entry-without-id]
+  (uuid (wal-entry-id-content entry-without-id)))
 
 (defn db-summary [{:keys [max-tx max-eid hash meta]}]
   {:max-tx max-tx
@@ -165,7 +168,13 @@
            :wal-id (:datahike/wal-id entry)}
 
           :else
-          (recur (:datahike/wal-id entry) more)))
+          (let [actual-wal-id (:datahike/wal-id entry)
+                expected-wal-id (wal-entry-id (dissoc entry :datahike/wal-id))]
+            (if (= expected-wal-id actual-wal-id)
+              (recur actual-wal-id more)
+              {:reason :wal-entry-id-mismatch
+               :expected-wal-id expected-wal-id
+               :actual-wal-id actual-wal-id}))))
 
       (not= (:datahike/wal-head wal-record) materialized-head)
       {:reason :wal-head-without-pending
