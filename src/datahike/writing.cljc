@@ -571,10 +571,11 @@
   (let [wal-head (:datahike/wal-head wal-record)
         local-cid (get-in local-stored-db [:meta :datahike/commit-id])
         db (cond
-             (and local-stored-db (= local-cid wal-head))
+             (and local-stored-db wal-head (= local-cid wal-head))
              (stored->db (assoc local-stored-db :config config) local-store)
 
-             (and local-stored-db (= local-cid (:datahike/materialized-head wal-record)))
+             (and local-stored-db (:datahike/materialized-head wal-record)
+                  (= local-cid (:datahike/materialized-head wal-record)))
              (stored->db (assoc local-stored-db :config config) local-store)
 
              (:datahike/materialized-db wal-record)

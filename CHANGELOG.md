@@ -21,6 +21,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 - **Hitchhiker-tree point lookup fallback** — the hitchhiker-tree index now implements the newer lookup/count-slice protocol methods used by query planning, avoiding ground-pattern query failures when this index backend is selected. (0.8.TODO, [#TODO])
 - **Remote WAL materialization serialization** — automatic remote-WAL materialization now runs through a per-writer queue, preventing concurrent background flushes from racing on store-level pending index writes. (0.8.TODO, [#TODO])
+- **Remote WAL nil local-cache commits ignored** — startup no longer treats a local snapshot with a missing WAL commit id as matching a nil remote head/materialized head, preventing speculative cache state from being used as a recovery base. (0.8.TODO, [#TODO])
 - **Remote WAL startup materialization** — `:remote-wal` connections with `:wal-auto-materialize? true` now schedule materialization after WAL replay on connect, warming the local cache and compacting pending WAL after recovery. (0.8.TODO, [#TODO])
 - **Remote WAL checkpoint validation** — remote-WAL connect/materialization now reject structurally inconsistent or unanchored materialized checkpoints instead of reconstructing from an incomplete source of truth. (0.8.TODO, [#TODO])
 - **Remote WAL materialization head validation** — remote materialization now revalidates the WAL head after flushing indexes and before compacting pending entries, avoiding writes over a concurrently corrupted or replaced head. (0.8.TODO, [#TODO])

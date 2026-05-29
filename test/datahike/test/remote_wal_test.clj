@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [datahike.config :as dc]
+            [datahike.core :as core]
             [datahike.index.secondary :as sec]
             [datahike.tools :as dt]
             [datahike.writing :as w]
@@ -488,6 +489,47 @@
             (ks/release-store (:store cfg) local-store {:sync? true}))))
       (finally
         (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
+(deftest remote-wal-restart-ignores-local-cache-with-nil-commit-id
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)
+        local-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [tx-report (d/transact @conn [{:db/id 1 :name "Committed remote"}])
+            ;; Simulate a stale/speculative local cache entry that has no WAL
+            ;; commit id. Startup must not treat nil as matching the remote
+            ;; materialized-head (also nil before first remote materialization).
+            leaked-db (:db-after (core/with (:db-after tx-report)
+                                            [{:db/id 2 :name "Leaked local"}]))]
+        (w/materialize-db-with-cid! leaked-db (uuid) {:sync? true})
+        (reset! local-store (ks/connect-store (:store cfg) {:sync? true}))
+        (let [local-head (k/get @local-store :db nil {:sync? true})]
+          (k/assoc @local-store :db
+                   (assoc-in local-head [:meta :datahike/commit-id] nil)
+                   {:sync? true})))
+      (when @local-store
+        (ks/release-store (:store cfg) @local-store {:sync? true})
+        (reset! local-store nil))
+      (d/release @conn)
+      (reset! conn nil)
+
+      (reset! restarted (d/connect cfg))
+      (is (= #{["Committed remote"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted))
+          "remote WAL recovery must ignore local snapshots without a WAL commit id")
+      (finally
+        (when @local-store
+          (ks/release-store (:store cfg) @local-store {:sync? true}))
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
