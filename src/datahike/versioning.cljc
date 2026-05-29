@@ -274,6 +274,7 @@
    (merge! conn parents tx-data nil))
   ([conn parents tx-data tx-meta]
    (parent-check parents)
+   (remote-wal-branch-check! conn 'merge!)
    @(datahike.writer/merge-db! conn {:parents parents
                                      :tx-data tx-data
                                      :tx-meta tx-meta})))
@@ -284,6 +285,7 @@
    (merge-async! conn parents tx-data nil))
   ([conn parents tx-data tx-meta]
    (parent-check parents)
+   (remote-wal-branch-check! conn 'merge!)
    (datahike.writer/merge-db! conn {:parents parents
                                     :tx-data tx-data
                                     :tx-meta tx-meta})))

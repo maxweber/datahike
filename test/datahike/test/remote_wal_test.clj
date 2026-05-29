@@ -215,6 +215,7 @@
       (expect-unsupported-branch-op #(d/branch! @conn :db :scratch))
       (expect-unsupported-branch-op #(d/delete-branch! @conn :scratch))
       (expect-unsupported-branch-op #(d/force-branch! @@conn :scratch #{nil}))
+      (expect-unsupported-branch-op #(d/merge-db @conn #{:db} []))
       (expect-unsupported-branch-op #(d/branch-as-db @conn :db))
       (finally
         (when @conn (d/release @conn))
