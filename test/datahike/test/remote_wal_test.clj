@@ -393,6 +393,35 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-simple-transaction-uses-one-remote-head-cas
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [original-cas-assoc! w/cas-assoc!
+            cas-count (atom 0)]
+        (with-redefs [w/cas-assoc! (fn [& args]
+                                     (swap! cas-count inc)
+                                     (apply original-cas-assoc! args))]
+          (let [tx-report (d/transact @conn [{:db/id 1 :name "One CAS"}])]
+            (is (= 1 @cas-count)
+                "a simple remote-WAL transaction should perform exactly one remote head CAS")
+            (is (uuid? (get-in tx-report [:tx-meta :db/commitId])))
+            (is (= #{["One CAS"]}
+                   (d/q '[:find ?n :where [?e :name ?n]] @@conn))))))
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (is (= 1 (count (:datahike/pending (k/get @remote-store :db nil {:sync? true})))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-commit-does-not-synchronously-materialize-local-cache
   (let [local-id (uuid)
         remote-id (uuid)
