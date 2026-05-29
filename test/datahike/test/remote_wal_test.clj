@@ -3,12 +3,26 @@
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [datahike.config :as dc]
+            [datahike.index.secondary :as sec]
             [datahike.writing :as w]
             [konserve.core :as k]
             [konserve.store :as ks]))
 
 (defn- uuid []
   (java.util.UUID/randomUUID))
+
+(defonce _remote-wal-secondary-index
+  (sec/register-index-type!
+   :remote-wal-test/secondary
+   (fn [config _db]
+     (reify
+       sec/ISecondaryIndex
+       (-search [_ _ _] nil)
+       (-estimate [_ _] 0)
+       (-can-order? [_ _ _] false)
+       (-slice-ordered [_ _ _ _ _ _] nil)
+       (-indexed-attrs [_] (set (:attrs config)))
+       (-transact [this _tx-report] this)))))
 
 (defn- delete-store-quietly! [store-config]
   (try
@@ -296,6 +310,39 @@
       (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
       (is (empty? (:datahike/pending (k/get @remote-store :db nil {:sync? true})))
           "guarded transaction functions must not append to the remote WAL")
+      (finally
+        (when @conn (d/release @conn))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
+(deftest remote-wal-secondary-indexes-fail-clearly
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (assoc (remote-wal-config local-id remote-id)
+                   :schema-flexibility :write)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/ident :person/name
+                          :db/valueType :db.type/string
+                          :db/cardinality :db.cardinality/one}])
+      (try
+        (d/transact @conn [{:db/ident :idx/name
+                            :db.secondary/type :remote-wal-test/secondary
+                            :db.secondary/attrs [:person/name]}])
+        (is false "expected remote WAL secondary-index guard to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/unsupported-secondary-index
+                 (ex-type e)))))
+      (is (nil? (get-in (d/db @conn) [:secondary-indices :idx/name]))
+          "failed secondary-index transaction must not publish locally")
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (is (= 1 (count (:datahike/pending (k/get @remote-store :db nil {:sync? true}))))
+          "failed secondary-index transaction must not append to the remote WAL")
       (finally
         (when @conn (d/release @conn))
         (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
