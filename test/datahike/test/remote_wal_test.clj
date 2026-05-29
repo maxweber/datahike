@@ -393,6 +393,34 @@
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-commit-does-not-synchronously-materialize-local-cache
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        local-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [tx-report (d/transact @conn [{:db/id 1 :name "Not local yet"}])
+            wal-cid (get-in tx-report [:tx-meta :db/commitId])]
+        (is (= #{["Not local yet"]}
+               (d/q '[:find ?n :where [?e :name ?n]] @@conn)))
+        (reset! local-store (ks/connect-store (:store cfg) {:sync? true}))
+        (let [local-head (k/get @local-store :db nil {:sync? true})
+              local-db (w/stored->db local-head @local-store)]
+          (is (not= wal-cid (get-in local-head [:meta :datahike/commit-id]))
+              "remote-WAL commit must not rewrite the local branch before materialization")
+          (is (empty? (d/q '[:find ?n :where [?e :name ?n]] local-db))
+              "winning WAL data should remain in memory until materialization runs")))
+      (finally
+        (when @local-store
+          (ks/release-store (:store cfg) @local-store {:sync? true}))
+        (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-local-materialization-uses-wal-commit-id
   (let [local-id (uuid)
         remote-id (uuid)
