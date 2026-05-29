@@ -680,6 +680,62 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-remote-materialization-failure-keeps-pending
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Interrupted materialization"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [before (k/get @remote-store :db nil {:sync? true})
+            result (with-redefs [w/materialize-db-with-cid!
+                                  (fn [& _]
+                                    (throw (ex-info "simulated remote materialization failure"
+                                                    {:type :remote-wal-test/materialization-failed})))]
+                     (try
+                       (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
+                       (catch Throwable e
+                         e)))
+            after (k/get @remote-store :db nil {:sync? true})]
+        (is (instance? Throwable result))
+        (is (= :remote-wal-test/materialization-failed (ex-type result)))
+        (is (= (select-keys before [:datahike/wal-head
+                                    :datahike/materialized-head
+                                    :datahike/materialized-db
+                                    :datahike/pending])
+               (select-keys after [:datahike/wal-head
+                                   :datahike/materialized-head
+                                   :datahike/materialized-db
+                                   :datahike/pending]))
+            "failed materialization must not clear pending WAL entries"))
+
+      (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg))
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})]
+        (is (empty? (:datahike/pending wal-head)))
+        (is (= (:datahike/wal-head wal-head)
+               (:datahike/materialized-head wal-head))))
+
+      (d/release @conn)
+      (reset! conn nil)
+      (reset! restarted (d/connect restart-cfg))
+      (is (= #{["Interrupted materialization"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted)))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-corrupt-entry-id-fails-clearly
   (let [local-id (uuid)
         remote-id (uuid)
