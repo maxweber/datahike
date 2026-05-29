@@ -4,6 +4,7 @@
             [datahike.api :as d]
             [datahike.config :as dc]
             [datahike.index.secondary :as sec]
+            [datahike.tools :as dt]
             [datahike.writing :as w]
             [konserve.core :as k]
             [konserve.store :as ks]))
@@ -977,17 +978,37 @@
       (reset! conn (d/connect cfg))
       (let [real-cas w/cas-assoc!
             cas-attempts (atom 0)
+            failed-instant (java.util.Date. 1000)
+            winning-instant (java.util.Date. 2000)
+            failed-created-at (java.util.Date. 1001)
+            winning-created-at (java.util.Date. 2001)
+            dates (atom [failed-instant failed-created-at
+                         winning-instant winning-created-at])
+            next-date (fn []
+                        (let [[old _] (swap-vals! dates
+                                                  #(if (seq %) (subvec % 1) %))]
+                          (or (first old)
+                              (throw (ex-info "unexpected extra WAL date allocation"
+                                              {:type :remote-wal-test/extra-date})))))
             tx-report (with-redefs [w/cas-assoc! (fn [& args]
                                                     (if (= 1 (swap! cas-attempts inc))
                                                       (let [ch (async/promise-chan)]
                                                         (async/put! ch :conflict)
                                                         ch)
-                                                      (apply real-cas args)))]
+                                                      (apply real-cas args)))
+                                     dt/get-date next-date]
                         (d/transact @conn [{:db/id 1 :name "Retried"}]))
             remote-store (ks/connect-store remote-store-config {:sync? true})
-            wal-head (k/get remote-store :db nil {:sync? true})]
+            wal-head (k/get remote-store :db nil {:sync? true})
+            wal-tx-meta (get-in (peek (:datahike/pending wal-head))
+                                [:datahike/txs 0 :tx-meta])]
         (is (map? tx-report))
         (is (= 2 @cas-attempts))
+        (is (empty? @dates))
+        (is (= winning-instant (get-in tx-report [:tx-meta :db/txInstant]))
+            "the failed speculative attempt's txInstant must not leak")
+        (is (= winning-instant (:db/txInstant wal-tx-meta))
+            "the WAL stores the txInstant from the attempt that won CAS")
         (is (= #{["Retried"]}
                (d/q '[:find ?n :where [?e :name ?n]] @@conn)))
         (is (= 1 (count (:datahike/pending wal-head))))
