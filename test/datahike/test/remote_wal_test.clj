@@ -797,6 +797,65 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-materialization-preserves-concurrent-suffix
+  (let [local-id-a (uuid)
+        local-id-b (uuid)
+        restart-local-id (uuid)
+        remote-id (uuid)
+        cfg-a (remote-wal-config local-id-a remote-id)
+        cfg-b (remote-wal-config local-id-b remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg-a [:writer :remote-store])
+        conn-a (atom nil)
+        conn-b (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg-a)
+      (reset! conn-a (d/connect cfg-a))
+      (reset! conn-b (d/connect cfg-b))
+      (d/transact @conn-a [{:db/id 1 :name "Materialized prefix"}])
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [original-materialize w/materialize-db-with-cid!
+            suffix-appended? (atom false)
+            materialized (with-redefs [w/materialize-db-with-cid!
+                                        (fn [& args]
+                                          (let [result (apply original-materialize args)]
+                                            (when-not @suffix-appended?
+                                              (reset! suffix-appended? true)
+                                              (d/transact @conn-b [{:db/id 2 :name "Concurrent suffix"}]))
+                                            result))]
+                           (w/remote-materialize-wal! @remote-store :db (dc/load-config cfg-a)))
+            wal-head (k/get @remote-store :db nil {:sync? true})
+            pending (vec (:datahike/pending wal-head))]
+        (is @suffix-appended?)
+        (is (= (:datahike/materialized-head materialized)
+               (:datahike/materialized-head wal-head)))
+        (is (not= (:datahike/materialized-head wal-head)
+                  (:datahike/wal-head wal-head))
+            "materialization should compact only the prefix it started from")
+        (is (= 1 (count pending)))
+        (is (= (:datahike/wal-head wal-head)
+               (:datahike/wal-id (peek pending)))
+            "a concurrent append should remain pending after prefix compaction"))
+
+      (d/release @conn-a)
+      (reset! conn-a nil)
+      (d/release @conn-b)
+      (reset! conn-b nil)
+      (reset! restarted (d/connect restart-cfg))
+      (is (= #{["Materialized prefix"] ["Concurrent suffix"]}
+             (d/q '[:find ?n :where [?e :name ?n]] @@restarted)))
+      (finally
+        (when @conn-a (d/release @conn-a))
+        (when @conn-b (d/release @conn-b))
+        (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg-a))
+        (delete-store-quietly! (:store cfg-b))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-remote-materialization-failure-keeps-pending
   (let [local-id (uuid)
         remote-id (uuid)
