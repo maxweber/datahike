@@ -295,9 +295,16 @@
                          db (-> (dsi/reconstruct-db-from-wal config store remote-store wal-record local-stored-db)
                                 (assoc :remote-wal-store remote-store
                                        :remote-wal-store-config remote-store-config))
-                         conn (conn-from-db db)]
-                     (swap! (:wrapped-atom conn) assoc :writer
-                            (w/create-writer (:writer config) conn))
+                         conn (conn-from-db db)
+                         db-with-writer (swap! (:wrapped-atom conn) assoc :writer
+                                               (w/create-writer (:writer config) conn))
+                         wal-head (:datahike/wal-head wal-record)
+                         local-cid (get-in local-stored-db [:meta :datahike/commit-id])]
+                     (when (and wal-head
+                                (:wal-auto-materialize? (:writer config))
+                                (or (seq (:datahike/pending wal-record))
+                                    (not= local-cid wal-head)))
+                       (w/schedule-remote-wal-materialization! db-with-writer))
                      (add-connection! conn-id conn)
                      conn))))))
 

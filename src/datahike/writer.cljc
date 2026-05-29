@@ -240,6 +240,15 @@
                                    :writer-config writer-config})
       (remote-wal-materialize-now! commit-db wal-id writer-config))))
 
+(defn schedule-remote-wal-materialization!
+  "Schedule asynchronous materialization for a remote-WAL DB value when enabled."
+  [db]
+  (let [writer-config (get-in db [:config :writer])
+        wal-id (get-in db [:meta :datahike/commit-id])]
+    (when (and (= :remote-wal (:backend writer-config))
+               wal-id)
+      (remote-wal-materialize-later! db wal-id writer-config))))
+
 (defn- remote-wal-apply-once!
   [connection invocation]
   (go-try-

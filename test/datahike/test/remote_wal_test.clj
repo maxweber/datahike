@@ -369,6 +369,52 @@
           (delete-store-quietly! (:store cfg))
           (delete-store-quietly! remote-store-config))))))
 
+(deftest remote-wal-connect-auto-materializes-reconstructed-head
+  (let [local-id (uuid)
+        restart-local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (assoc-in (remote-wal-config restart-local-id remote-id)
+                              [:writer :wal-auto-materialize?]
+                              true)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)
+        restart-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (d/transact @conn [{:db/id 1 :name "Startup materialize"}])
+      (d/release @conn)
+      (reset! conn nil)
+
+      (reset! restarted (d/connect restart-cfg))
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (is (wait-until #(empty? (:datahike/pending (k/get @remote-store :db nil {:sync? true})))
+                      5000)
+          "connect should schedule remote materialization when auto-materialize is enabled")
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})]
+        (is (= (:datahike/wal-head wal-head)
+               (:datahike/materialized-head wal-head))))
+
+      (reset! restart-store (ks/connect-store (:store restart-cfg) {:sync? true}))
+      (let [local-head (k/get @restart-store :db nil {:sync? true})
+            wal-head (k/get @remote-store :db nil {:sync? true})]
+        (is (= (:datahike/wal-head wal-head)
+               (get-in local-head [:meta :datahike/commit-id]))
+            "connect should also materialize the reconstructed head into the local cache"))
+      (finally
+        (when @restart-store
+          (ks/release-store (:store restart-cfg) @restart-store {:sync? true}))
+        (when @remote-store
+          (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (when @restarted (d/release @restarted))
+        (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-replay-preserves-schema-upsert-retractions-and-history
   (let [local-id (uuid)
         remote-id (uuid)
