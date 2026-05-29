@@ -74,6 +74,49 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= :remote-wal/missing-remote-store (:type (ex-data e))))))))
 
+  (testing "remote WAL remote-store must be a store config map"
+    (let [cfg (assoc-in (remote-wal-config (uuid) (uuid))
+                        [:writer :remote-store]
+                        :not-a-store)]
+      (try
+        (dc/load-config cfg)
+        (is false "expected remote WAL remote-store validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/invalid-remote-store (:type (ex-data e))))))))
+
+  (testing "remote WAL only supports keyword WAL branches matching the Datahike branch"
+    (let [invalid-wal-branch (assoc-in (remote-wal-config (uuid) (uuid))
+                                       [:writer :wal-branch]
+                                       "db")
+          mismatched-branch (assoc (remote-wal-config (uuid) (uuid))
+                                   :branch :other)]
+      (try
+        (dc/load-config invalid-wal-branch)
+        (is false "expected remote WAL wal-branch validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/invalid-wal-branch (:type (ex-data e))))))
+      (try
+        (dc/load-config mismatched-branch)
+        (is false "expected remote WAL branch validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/unsupported-branch (:type (ex-data e))))))))
+
+  (testing "remote WAL rejects unsupported audit and online-GC modes"
+    (let [crypto-cfg (assoc (remote-wal-config (uuid) (uuid))
+                            :crypto-hash? true)
+          online-gc-cfg (assoc (remote-wal-config (uuid) (uuid))
+                               :online-gc {:enabled? true})]
+      (try
+        (dc/load-config crypto-cfg)
+        (is false "expected remote WAL crypto-hash validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/unsupported-crypto-hash (:type (ex-data e))))))
+      (try
+        (dc/load-config online-gc-cfg)
+        (is false "expected remote WAL online-GC validation to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/unsupported-online-gc (:type (ex-data e))))))))
+
   (testing "remote WAL rejects initial-tx instead of creating local-only seed data"
     (let [cfg (assoc (remote-wal-config (uuid) (uuid))
                      :initial-tx [{:db/id 1 :name "seed"}])]
