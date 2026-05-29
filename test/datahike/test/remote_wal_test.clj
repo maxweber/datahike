@@ -314,11 +314,42 @@
       (let [tx-report (d/transact @conn [{:db/id 1 :name "Bob"}])
             wal-cid (get-in tx-report [:tx-meta :db/commitId])
             _ (w/materialize-db-with-cid! (:db-after tx-report) wal-cid {:sync? true})
-            local-store (ks/connect-store (:store cfg) {:sync? true})
-            local-head (k/get local-store :db nil {:sync? true})]
-        (is (= wal-cid (get-in local-head [:meta :datahike/commit-id]))))
+            local-store (ks/connect-store (:store cfg) {:sync? true})]
+        (try
+          (let [local-head (k/get local-store :db nil {:sync? true})]
+            (is (= wal-cid (get-in local-head [:meta :datahike/commit-id]))))
+          (finally
+            (ks/release-store (:store cfg) local-store {:sync? true}))))
       (finally
         (when @conn (d/release @conn))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
+(deftest remote-wal-restart-uses-local-materialized-head-without-replay
+  (let [remote-id (uuid)
+        cfg (remote-wal-config-with-store (temp-file-store-config) remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        conn (atom nil)
+        restarted (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [tx-report (d/transact @conn [{:db/id 1 :name "Cached restart"}])
+            wal-cid (get-in tx-report [:tx-meta :db/commitId])]
+        (w/materialize-db-with-cid! (:db-after tx-report) wal-cid {:sync? true}))
+      (d/release @conn)
+      (reset! conn nil)
+
+      (with-redefs [w/replay-wal-entry
+                    (fn [& _]
+                      (throw (ex-info "local materialized WAL head should not replay pending WAL"
+                                      {:type :remote-wal-test/unexpected-replay})))]
+        (reset! restarted (d/connect cfg))
+        (is (= #{["Cached restart"]}
+               (d/q '[:find ?n :where [?e :name ?n]] @@restarted))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
         (delete-store-quietly! (:store cfg))
         (delete-store-quietly! remote-store-config)))))
 
