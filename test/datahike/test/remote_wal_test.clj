@@ -605,6 +605,65 @@
         (delete-store-quietly! (:store restart-cfg))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-replay-preserves-transaction-metadata
+  (let [local-id (uuid)
+        remote-id (uuid)
+        restart-local-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        restart-cfg (remote-wal-config restart-local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        fixed-instant (java.util.Date. 42424242)
+        conn (atom nil)
+        restarted (atom nil)
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! conn (d/connect cfg))
+      (let [tx-report (d/transact @conn {:tx-data [{:db/id 1
+                                                     :name "Metadata"}]
+                                          :tx-meta {:source "remote-wal-test"
+                                                    :db/txInstant fixed-instant}})
+            tx-id (get-in tx-report [:db-after :max-tx])]
+        (is (= "remote-wal-test" (get-in tx-report [:tx-meta :source])))
+        (is (= fixed-instant (get-in tx-report [:tx-meta :db/txInstant])))
+        (is (= #{["remote-wal-test" fixed-instant]}
+               (d/q '[:find ?source ?instant
+                      :in $ ?tx
+                      :where
+                      [?tx :source ?source]
+                      [?tx :db/txInstant ?instant]]
+                    @@conn tx-id)))
+        (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+        (let [wal-entry (-> (k/get @remote-store :db nil {:sync? true})
+                            :datahike/pending
+                            peek)
+              wal-tx-meta (get-in wal-entry [:datahike/txs 0 :tx-meta])]
+          (is (= "remote-wal-test" (:source wal-tx-meta)))
+          (is (= fixed-instant (:db/txInstant wal-tx-meta)))
+          (is (not (contains? wal-tx-meta :db/commitId))
+              "WAL tx metadata should not include the post-CAS commit id"))
+
+        ;; Replay from the remote WAL into a different local cache. Custom
+        ;; transaction metadata is stored as concrete tx datoms and must remain
+        ;; queryable after recovery.
+        (d/release @conn)
+        (reset! conn nil)
+        (reset! restarted (d/connect restart-cfg))
+        (is (= #{["remote-wal-test" fixed-instant]}
+               (d/q '[:find ?source ?instant
+                      :in $ ?tx
+                      :where
+                      [?tx :source ?source]
+                      [?tx :db/txInstant ?instant]]
+                    @@restarted tx-id))))
+      (finally
+        (when @conn (d/release @conn))
+        (when @restarted (d/release @restarted))
+        (when @remote-store (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! (:store restart-cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-replay-preserves-max-eid-for-ref-only-tempids
   (let [local-id (uuid)
         remote-id (uuid)
