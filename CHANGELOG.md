@@ -19,6 +19,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Remote WAL empty initial transactions** — empty `:initial-tx` values are now treated as absent in `:remote-wal` configs, avoiding an unexpected no-op WAL entry during database creation. (0.8.TODO, [#TODO])
 - **Remote WAL branch validation** — remote WAL heads whose embedded branch does not match the configured WAL branch are now rejected instead of being treated as the current database. (0.8.TODO, [#TODO])
 - **Remote WAL initial transaction guard** — `:remote-wal` configs now reject `:initial-tx` instead of creating seed data only in the local cache and omitting it from the remote WAL source of truth. (0.8.TODO, [#TODO])
 - **Remote WAL replay version tolerance** — WAL summaries now ignore local Datahike/konserve/index library version metadata, so replay validates logical DB state across library upgrades instead of failing on expected version drift. (0.8.TODO, [#TODO])

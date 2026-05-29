@@ -59,6 +59,24 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= :remote-wal/unsupported-initial-tx (:type (ex-data e))))))))
 
+  (testing "remote WAL ignores empty initial-tx"
+    (let [cfg (assoc (remote-wal-config (uuid) (uuid))
+                     :initial-tx [])
+          remote-store-config (get-in cfg [:writer :remote-store])
+          remote-store (atom nil)]
+      (try
+        (is (not (contains? (dc/load-config cfg) :initial-tx)))
+        (is (not (contains? (dc/load-config (assoc cfg :initial-tx "")) :initial-tx)))
+        (d/create-database cfg)
+        (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+        (is (empty? (:datahike/pending (k/get @remote-store :db nil {:sync? true})))
+            "empty initial-tx must not append a no-op WAL entry")
+        (finally
+          (when @remote-store
+            (ks/release-store remote-store-config @remote-store {:sync? true}))
+          (delete-store-quietly! (:store cfg))
+          (delete-store-quietly! remote-store-config)))))
+
   (testing "stores without explicit CAS support fail clearly"
     (try
       (w/cas-assoc! {} :db nil {})

@@ -131,7 +131,9 @@
                          :config config}))
 
         :else
-        (assoc config :writer writer)))))
+        (cond-> (assoc config :writer writer)
+          (not (remote-wal-initial-tx? initial-tx))
+          (dissoc :initial-tx))))))
 
 (defn from-deprecated
   [{:keys [backend username password path host port id] :as _backend-cfg}
