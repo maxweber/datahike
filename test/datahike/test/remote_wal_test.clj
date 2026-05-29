@@ -138,6 +138,32 @@
         (delete-store-quietly! (:store cfg-b))
         (delete-store-quietly! remote-store-config)))))
 
+(deftest remote-wal-head-branch-mismatch-fails-clearly
+  (let [local-id (uuid)
+        remote-id (uuid)
+        cfg (remote-wal-config local-id remote-id)
+        remote-store-config (get-in cfg [:writer :remote-store])
+        remote-store (atom nil)]
+    (try
+      (d/create-database cfg)
+      (reset! remote-store (ks/connect-store remote-store-config {:sync? true}))
+      (let [wal-head (k/get @remote-store :db nil {:sync? true})]
+        (k/assoc @remote-store :db (assoc wal-head :datahike/branch :other) {:sync? true}))
+      (is (false? (d/database-exists? cfg))
+          "a WAL head for a different branch is not this remote-WAL database")
+      (try
+        (d/connect cfg)
+        (is false "expected remote WAL branch mismatch to fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :remote-wal/invalid-head (:type (ex-data e))))
+          (is (= :db (:expected-branch (ex-data e))))
+          (is (= :other (:actual-branch (ex-data e))))))
+      (finally
+        (when @remote-store
+          (ks/release-store remote-store-config @remote-store {:sync? true}))
+        (delete-store-quietly! (:store cfg))
+        (delete-store-quietly! remote-store-config)))))
+
 (deftest remote-wal-delete-removes-head-without-dropping-remote-store
   (let [remote-id (uuid)
         local-id (uuid)

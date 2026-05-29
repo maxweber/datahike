@@ -186,10 +186,12 @@
     (log/raise "Remote WAL head does not exist. Use create-database before connect/transact."
                {:type :remote-wal/head-missing
                 :wal-key wal-key}))
-  (when-not (w/remote-wal-record? (:value wal-read))
-    (log/raise "Remote WAL head object is not a Datahike remote WAL record."
+  (when-not (w/remote-wal-record? (:value wal-read) wal-key)
+    (log/raise "Remote WAL head object is not a Datahike remote WAL record for this branch."
                {:type :remote-wal/invalid-head
                 :wal-key wal-key
+                :expected-branch wal-key
+                :actual-branch (:datahike/branch (:value wal-read))
                 :value (:value wal-read)})))
 
 (defn- remote-wal-transaction-fn-op [entity]

@@ -290,10 +290,12 @@
                                          :wal-key wal-key
                                          :config config}))
                          wal-record (:value wal-read)
-                         _ (when-not (dsi/remote-wal-record? wal-record)
-                             (log/raise "Remote WAL head object is not a Datahike remote WAL record."
+                         _ (when-not (dsi/remote-wal-record? wal-record wal-key)
+                             (log/raise "Remote WAL head object is not a Datahike remote WAL record for this branch."
                                         {:type :remote-wal/invalid-head
                                          :wal-key wal-key
+                                         :expected-branch wal-key
+                                         :actual-branch (:datahike/branch wal-record)
                                          :value wal-record}))
                          local-stored-db (<?- (k/get store (:branch config) nil opts))
                          db (-> (dsi/reconstruct-db-from-wal config store remote-store wal-record local-stored-db)

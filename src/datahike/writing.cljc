@@ -109,10 +109,14 @@
          wal-id (wal-entry-id entry-without-id)]
      (assoc entry-without-id :datahike/wal-id wal-id))))
 
-(defn remote-wal-record? [obj]
-  (and (map? obj)
-       (true? (:datahike/remote-wal? obj))
-       (= remote-wal-version (:datahike/wal-version obj))))
+(defn remote-wal-record?
+  ([obj]
+   (and (map? obj)
+        (true? (:datahike/remote-wal? obj))
+        (= remote-wal-version (:datahike/wal-version obj))))
+  ([obj branch]
+   (and (remote-wal-record? obj)
+        (= branch (:datahike/branch obj)))))
 
 (defn initial-remote-wal-record [branch]
   {:datahike/remote-wal? true
@@ -912,10 +916,12 @@
                         (log/raise "Remote WAL head does not exist."
                                    {:type :remote-wal/head-missing
                                     :wal-key wal-key}))
-                      (when-not (remote-wal-record? (:value wal-read))
-                        (log/raise "Remote WAL head object is not a Datahike remote WAL record."
+                      (when-not (remote-wal-record? (:value wal-read) wal-key)
+                        (log/raise "Remote WAL head object is not a Datahike remote WAL record for this branch."
                                    {:type :remote-wal/invalid-head
                                     :wal-key wal-key
+                                    :expected-branch wal-key
+                                    :actual-branch (:datahike/branch (:value wal-read))
                                     :value (:value wal-read)}))
                       (let [wal-record (:value wal-read)
                             pending (vec (:datahike/pending wal-record))]
@@ -1010,7 +1016,9 @@
                      branch (if remote-wal?
                               (get-in config [:writer :wal-branch])
                               :db)
-                     exists? (if remote-wal? remote-wal-record? some?)
+                     exists? (if remote-wal?
+                               #(remote-wal-record? % branch)
+                               some?)
                      store-exists? (<?- (ks/store-exists? store-config opts))]
                  (if store-exists?
                    (let [raw-store (<?- (ks/connect-store store-config opts))
